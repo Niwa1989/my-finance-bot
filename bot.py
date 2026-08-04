@@ -12,7 +12,8 @@ from telebot import types
 # КОНФИГУРАЦИЯ
 # ============================================
 
-TOKEN = os.environ.get('TELEGRAM_TOKEN')bot = telebot.TeleBot(TOKEN)
+TOKEN = os.environ.get('TELEGRAM_TOKEN')
+bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
 # Пути к данным (Render использует временную файловую систему)
