@@ -17,6 +17,7 @@ from telebot import types
 # ============================================
 
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
+bot = telebot.TeleBot(TOKEN)
 # Сетевые запросы Playerok могут ожидать внешний API. Дополнительные рабочие
 # потоки не дают им блокировать обычные кнопки финансового бота.
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8)
@@ -29,9 +30,19 @@ PLAYEROK_API_URL = (
     'https://api.parse.bot/scraper/'
     '4688010c-bf13-44a2-bef6-4db5e643b286'
 )
+PLAYEROK_TIMEOUT = int(os.environ.get('PLAYEROK_TIMEOUT', '30'))
+# Каталог читается напрямую через публичные persisted GraphQL-запросы Playerok.
+# Хэши запросов взяты из PlayerokAPI: https://github.com/alleexxeeyy/PlayerokAPI
+# Авторизация и PARSE_API_KEY для просмотра публичных лотов не нужны.
+PLAYEROK_GRAPHQL_URL = 'https://playerok.com/graphql'
+PLAYEROK_QUERY_HASHES = {
+    'games': '5de9b3240c148579c82e2310a30b4aad5462884fd1abf93dd3c43d1f5ef14d85',
+    'items': '3f20c731f8f769a094ee3fa32e09f8e12250357e9a4f0ebb4e6988e7a0bb9260'
+}
 PLAYEROK_TIMEOUT = int(os.environ.get('PLAYEROK_TIMEOUT', '12'))
 PLAYEROK_SEARCH_PAGES = max(1, min(int(os.environ.get('PLAYEROK_SEARCH_PAGES', '4')), 10))
 PLAYEROK_API_SNAPSHOT_VERSION = os.environ.get('PLAYEROK_API_SNAPSHOT_VERSION', '4')
+PLAYEROK_API_RETRIES = max(1, min(int(os.environ.get('PLAYEROK_API_RETRIES', '3')), 5))
 PLAYEROK_API_RETRIES = max(1, min(int(os.environ.get('PLAYEROK_API_RETRIES', '2')), 5))
 
 # Пути к данным
@@ -976,6 +987,9 @@ class PlayerokApiError(RuntimeError):
 class PlayerokClient:
     def __init__(self, api_key=None):
         self.api_key = api_key or PLAYEROK_API_KEY
+    """Клиент публичного каталога Playerok без авторизации в аккаунте."""
+
+    def __init__(self):
         self.session = requests.Session()
 
     def _get(self, endpoint, **params):
@@ -984,17 +998,41 @@ class PlayerokClient:
                 "Не задан PARSE_API_KEY. Добавьте его в переменные окружения Render."
             )
 
+    def _query(self, operation, variables):
+        params = {
+            "operationName": operation,
+            "variables": json.dumps(variables, ensure_ascii=False, separators=(',', ':')),
+            "extensions": json.dumps({
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": PLAYEROK_QUERY_HASHES[operation]
+                }
+            }, separators=(',', ':'))
+        }
         response = None
         for attempt in range(PLAYEROK_API_RETRIES):
             try:
                 response = self.session.get(
                     f"{PLAYEROK_API_URL}/{endpoint}",
+                    PLAYEROK_GRAPHQL_URL,
                     headers={
                         "X-API-Key": self.api_key,
                         "API-Snapshot-Version": PLAYEROK_API_SNAPSHOT_VERSION,
                         "Accept": "application/json"
+                        "Accept": "*/*",
+                        "Apollo-Require-Preflight": "true",
+                        "Apollographql-Client-Name": "web",
+                        "Origin": "https://playerok.com",
+                        "Referer": "https://playerok.com/",
+                        "X-GQL-Op": operation,
+                        "X-Apollo-Operation-Name": operation,
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 Chrome/143.0 Safari/537.36"
+                        )
                     },
                     params={key: value for key, value in params.items() if value is not None},
+                    params=params,
                     timeout=PLAYEROK_TIMEOUT
                 )
             except requests.Timeout as exc:
@@ -1021,14 +1059,18 @@ class PlayerokClient:
                 except (TypeError, ValueError):
                     delay = 1 + attempt
                 time.sleep(delay)
+                time.sleep(1 + attempt)
 
         if response is None:
             raise PlayerokApiError("Playerok API не вернул ответ.")
 
+            raise PlayerokApiError("Playerok не вернул ответ.")
         if response.status_code == 429:
             raise PlayerokApiError("Превышен лимит запросов Playerok API. Попробуйте позже.")
+            raise PlayerokApiError("Playerok ограничил частоту запросов. Попробуйте позже.")
         if response.status_code in (401, 403):
             raise PlayerokApiError("PARSE_API_KEY отсутствует или недействителен.")
+            raise PlayerokApiError("Playerok отклонил запрос к публичному каталогу.")
         if response.status_code in (502, 503, 504):
             # Ошибка относится к стороне Parse/Playerok, а не к ключу пользователя.
             try:
@@ -1039,10 +1081,13 @@ class PlayerokClient:
             print(
                 f"Playerok API временно недоступен: endpoint={endpoint}, "
                 f"status={response.status_code}, details={details or response.text[:300]}"
+                f"Playerok временно недоступен: operation={operation}, "
+                f"status={response.status_code}, details={response.text[:300]}"
             )
             raise PlayerokApiError(
                 f"Сервис каталога Playerok временно недоступен ({response.status_code}). "
                 "Ключ принят; повторите поиск через несколько минут."
+                f"Каталог Playerok временно недоступен ({response.status_code})."
             )
 
         try:
@@ -1051,14 +1096,35 @@ class PlayerokClient:
         except (requests.RequestException, ValueError) as exc:
             raise PlayerokApiError(
                 f"Playerok API вернул некорректный ответ ({response.status_code})."
+                f"Playerok вернул некорректный ответ ({response.status_code})."
             ) from exc
 
         if isinstance(payload, dict) and payload.get("error"):
             raise PlayerokApiError(str(payload["error"]))
         return payload
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if errors:
+            message = errors[0].get("message") if isinstance(errors[0], dict) else str(errors[0])
+            print(f"Playerok GraphQL error ({operation}): {message}")
+            raise PlayerokApiError("Playerok изменил формат каталога. Требуется обновить запросы.")
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        connection = data.get(operation) if isinstance(data, dict) else None
+        if not isinstance(connection, dict):
+            raise PlayerokApiError("Playerok вернул пустой или неизвестный формат каталога.")
+        return connection
 
     def search_games(self, query, limit=10):
         return self._get("search_games", query=query, limit=max(1, min(limit, 50)))
+        connection = self._query("games", {
+            "pagination": {"first": max(1, min(limit, 20)), "after": None},
+            "filter": {"name": query, "type": None}
+        })
+        games = [
+            edge.get("node") for edge in connection.get("edges", [])
+            if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
+        ]
+        return {"games": games, "total_count": connection.get("totalCount", len(games))}
 
     def list_items(self, game_id, game_category_id=None, cursor=None, limit=50):
         return self._get(
@@ -1070,6 +1136,43 @@ class PlayerokClient:
             sort_field="price",
             sort_direction="ASC"
         )
+    def list_items(self, game_id, game_category_id=None, cursor=None, limit=50,
+                   search_query=None):
+        item_filter = {
+            "gameId": game_id,
+            "gameCategoryId": game_category_id,
+            "status": ["APPROVED"]
+        }
+        if search_query:
+            item_filter["searchQuery"] = search_query
+
+        connection = self._query("items", {
+            # Публичный запрос Playerok отклоняет страницы больше 20 элементов.
+            "pagination": {"first": max(1, min(limit, 20)), "after": cursor},
+            "filter": item_filter,
+            "showForbiddenImage": True
+        })
+        products = []
+        for edge in connection.get("edges", []):
+            node = edge.get("node") if isinstance(edge, dict) else None
+            if not isinstance(node, dict):
+                continue
+            product = dict(node)
+            product["raw_price"] = product.get("rawPrice")
+            product["seller"] = product.get("user") or {}
+            if product.get("slug"):
+                product["url"] = f"https://playerok.com/products/{product['slug']}"
+            products.append(product)
+
+        page_info = connection.get("pageInfo") or {}
+        return {
+            "products": products,
+            "total_count": connection.get("totalCount", len(products)),
+            "page_info": {
+                "has_next_page": bool(page_info.get("hasNextPage")),
+                "end_cursor": page_info.get("endCursor")
+            }
+        }
 
 
 playerok_client = PlayerokClient()
@@ -1206,6 +1309,8 @@ def search_playerok_products(user_data, query, count):
             game_category_id=category.get("id"),
             cursor=cursor,
             limit=50
+            limit=50,
+            search_query=query
         )
         products = _collection(payload, "products", "items", "results")
         for product in products:
@@ -1332,9 +1437,11 @@ def process_playerok_game(message):
             "games", "results", "items"
         )
     except PlayerokApiError as exc:
+        bot.reply_to(message, f"❌ {exc}")
         bot.edit_message_text(f"❌ {exc}", progress.chat.id, progress.message_id)
         return
     if not games:
+        bot.reply_to(message, "❌ Игра не найдена. Проверьте правильность названия.")
         bot.edit_message_text(
             "❌ Игра не найдена. Проверьте правильность названия.",
             progress.chat.id,
@@ -1349,6 +1456,7 @@ def process_playerok_game(message):
             str(game.get("name") or "Без названия"),
             callback_data=f"pok_game:{index}"
         ))
+    bot.send_message(message.chat.id, "Выберите игру:", reply_markup=markup)
     bot.edit_message_text(
         "Выберите игру:",
         progress.chat.id,
@@ -1392,6 +1500,7 @@ def choose_playerok_category(message):
         )
         games = _collection(payload, "games", "results", "items")
     except PlayerokApiError as exc:
+        bot.reply_to(message, f"❌ {exc}")
         bot.edit_message_text(f"❌ {exc}", progress.chat.id, progress.message_id)
         return
 
@@ -1412,6 +1521,7 @@ def choose_playerok_category(message):
 
     categories = game.get("categories") if game else []
     if not categories:
+        bot.reply_to(message, "❌ Для этой игры категории не найдены.")
         bot.edit_message_text(
             "❌ Для этой игры категории не найдены.",
             progress.chat.id,
@@ -1426,6 +1536,8 @@ def choose_playerok_category(message):
             str(category.get("name") or "Без категории"),
             callback_data=f"pok_category:{index}"
         ))
+    bot.send_message(
+        message.chat.id,
     bot.edit_message_text(
         f"📂 Выберите категорию для {selected.get('name', 'игры')}:",
         progress.chat.id,
