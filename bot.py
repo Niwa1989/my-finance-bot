@@ -3,9 +3,13 @@ import time
 import json
 import shutil
 import threading
+import difflib
+import html
+import re
 from datetime import datetime, timedelta
 from flask import Flask
 import telebot
+import requests
 from telebot import types
 
 # ============================================
@@ -15,6 +19,16 @@ from telebot import types
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+
+# Playerok не публикует официальный API для каталога. Используется поддерживаемый
+# REST-адаптер Parse поверх публичных данных Playerok.
+PLAYEROK_API_KEY = os.environ.get('PARSE_API_KEY')
+PLAYEROK_API_URL = (
+    'https://api.parse.bot/scraper/'
+    '4688010c-bf13-44a2-bef6-4db5e643b286'
+)
+PLAYEROK_TIMEOUT = int(os.environ.get('PLAYEROK_TIMEOUT', '30'))
+PLAYEROK_SEARCH_PAGES = max(1, min(int(os.environ.get('PLAYEROK_SEARCH_PAGES', '4')), 10))
 
 # Пути к данным
 DATA_FILE = 'bot_data.json'
@@ -33,7 +47,15 @@ def get_default_user_data():
         "log": [],
         "goal": None,
         "goal_date": None,
-        "settings": {"last_id": 0}
+        "settings": {
+            "last_id": 0,
+            "playerok_game": {
+                "id": None,
+                "name": "SCraft",
+                "slug": "scraft",
+                "items_category_id": None
+            }
+        }
     }
 
 
@@ -147,7 +169,8 @@ def show_main_menu(message):
     btn3 = types.KeyboardButton('🎯 Цель')
     btn4 = types.KeyboardButton('📊 Статистика')
     btn5 = types.KeyboardButton('ℹ️ Помощь')
-    markup.add(btn1, btn2, btn3, btn4, btn5)
+    btn6 = types.KeyboardButton('🛒 Playerok')
+    markup.add(btn1, btn2, btn3, btn4, btn6, btn5)
     bot.send_message(
         message.chat.id,
         "🏠 *БОТ ФИНАНСОВЫЙ ПОМОЩНИК*\n\nВыберите действие:",
@@ -934,6 +957,415 @@ def show_period_stats(message):
 
 
 # ============================================
+# PLAYEROK: ПОИСК И СРАВНЕНИЕ ЛОТОВ
+# ============================================
+
+class PlayerokApiError(RuntimeError):
+    """Понятная пользователю ошибка доступа к каталогу Playerok."""
+
+
+class PlayerokClient:
+    def __init__(self, api_key=None):
+        self.api_key = api_key or PLAYEROK_API_KEY
+        self.session = requests.Session()
+
+    def _get(self, endpoint, **params):
+        if not self.api_key:
+            raise PlayerokApiError(
+                "Не задан PARSE_API_KEY. Добавьте его в переменные окружения Render."
+            )
+
+        try:
+            response = self.session.get(
+                f"{PLAYEROK_API_URL}/{endpoint}",
+                headers={"X-API-Key": self.api_key, "Accept": "application/json"},
+                params={key: value for key, value in params.items() if value is not None},
+                timeout=PLAYEROK_TIMEOUT
+            )
+        except requests.Timeout as exc:
+            raise PlayerokApiError("Playerok отвечает слишком долго. Попробуйте ещё раз.") from exc
+        except requests.RequestException as exc:
+            raise PlayerokApiError("Не удалось подключиться к каталогу Playerok.") from exc
+
+        if response.status_code == 429:
+            raise PlayerokApiError("Превышен лимит запросов Playerok API. Попробуйте позже.")
+        if response.status_code in (401, 403):
+            raise PlayerokApiError("PARSE_API_KEY отсутствует или недействителен.")
+
+        try:
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise PlayerokApiError(
+                f"Playerok API вернул некорректный ответ ({response.status_code})."
+            ) from exc
+
+        if isinstance(payload, dict) and payload.get("error"):
+            raise PlayerokApiError(str(payload["error"]))
+        return payload
+
+    def search_games(self, query, limit=10):
+        return self._get("search_games", query=query, limit=max(1, min(limit, 50)))
+
+    def list_items(self, game_id, game_category_id=None, cursor=None, limit=50):
+        return self._get(
+            "list_items",
+            game_id=game_id,
+            game_category_id=game_category_id,
+            cursor=cursor,
+            limit=max(1, min(limit, 50)),
+            sort_field="price",
+            sort_direction="ASC"
+        )
+
+
+playerok_client = PlayerokClient()
+
+
+def _collection(payload, *keys):
+    """Извлекает массив из обычного либо обёрнутого ответа API."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return _collection(data, *keys)
+    return []
+
+
+def _normalize_search_text(value):
+    value = str(value or '').casefold().replace('ё', 'е')
+    return ' '.join(re.findall(r'[a-zа-я0-9]+', value, flags=re.IGNORECASE))
+
+
+def _items_category_id(game):
+    categories = game.get("categories") or []
+    for category in categories:
+        name = _normalize_search_text(category.get("name"))
+        slug = _normalize_search_text(category.get("slug"))
+        if "предмет" in name or slug in {"items", "item"}:
+            return category.get("id")
+    return None
+
+
+def _playerok_game(user_data):
+    settings = user_data.setdefault("settings", {})
+    game = settings.setdefault("playerok_game", {})
+    game.setdefault("id", None)
+    game.setdefault("name", "SCraft")
+    game.setdefault("slug", "scraft")
+    game.setdefault("items_category_id", None)
+    return game
+
+
+def _resolve_game(user_data):
+    selected = _playerok_game(user_data)
+    if selected.get("id"):
+        return selected
+
+    payload = playerok_client.search_games(selected.get("name") or "SCraft", limit=10)
+    games = _collection(payload, "games", "results", "items")
+    if not games:
+        raise PlayerokApiError("Игра не найдена. Проверьте её название.")
+
+    wanted = _normalize_search_text(selected.get("name"))
+    game = min(
+        games,
+        key=lambda entry: (
+            _normalize_search_text(entry.get("name")) != wanted,
+            len(_normalize_search_text(entry.get("name")))
+        )
+    )
+    selected.update({
+        "id": game.get("id"),
+        "name": game.get("name") or selected.get("name"),
+        "slug": game.get("slug") or selected.get("slug"),
+        "items_category_id": _items_category_id(game)
+    })
+    return selected
+
+
+def _product_matches(product_name, query):
+    name = _normalize_search_text(product_name)
+    needle = _normalize_search_text(query)
+    if not needle:
+        return False
+    if needle in name:
+        return True
+    tokens = [token for token in needle.split() if len(token) > 1]
+    return bool(tokens) and all(token in name for token in tokens)
+
+
+def _price_value(product):
+    value = product.get("price")
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r'[^0-9,.]', '', str(value or '')).replace(',', '.')
+    try:
+        return float(cleaned)
+    except ValueError:
+        return float('inf')
+
+
+def search_playerok_products(user_data, query, count):
+    game = _resolve_game(user_data)
+    matches = []
+    seen_ids = set()
+    catalog_names = []
+    cursor = None
+
+    for _ in range(PLAYEROK_SEARCH_PAGES):
+        payload = playerok_client.list_items(
+            game_id=game.get("id"),
+            game_category_id=game.get("items_category_id"),
+            cursor=cursor,
+            limit=50
+        )
+        products = _collection(payload, "products", "items", "results")
+        for product in products:
+            name = str(product.get("name") or '').strip()
+            if name:
+                catalog_names.append(name)
+            product_id = product.get("id") or product.get("slug") or name
+            if product_id in seen_ids:
+                continue
+            seen_ids.add(product_id)
+            if product.get("status") not in (None, "APPROVED"):
+                continue
+            if _product_matches(name, query):
+                matches.append(product)
+
+        if len(matches) >= count:
+            break
+        page_info = payload.get("page_info", {}) if isinstance(payload, dict) else {}
+        if not page_info.get("has_next_page"):
+            break
+        cursor = page_info.get("end_cursor")
+        if not cursor:
+            break
+
+    needle = _normalize_search_text(query)
+    matches.sort(key=lambda item: (
+        _normalize_search_text(item.get("name")) != needle,
+        not _normalize_search_text(item.get("name")).startswith(needle),
+        _price_value(item)
+    ))
+
+    suggestions = []
+    if not matches and catalog_names:
+        normalized_to_original = {
+            _normalize_search_text(name): name for name in catalog_names
+        }
+        close = difflib.get_close_matches(
+            needle, list(normalized_to_original), n=3, cutoff=0.35
+        )
+        suggestions = [normalized_to_original[name] for name in close]
+
+    return game, matches[:count], suggestions
+
+
+def _format_playerok_results(game, query, products):
+    lines = [
+        f"🛒 <b>{html.escape(game.get('name') or 'Playerok')}</b>",
+        f"🔎 Запрос: <b>{html.escape(query)}</b>",
+        f"📦 Найдено лотов: <b>{len(products)}</b>",
+        ""
+    ]
+    prices = []
+    for index, product in enumerate(products, 1):
+        name = html.escape(str(product.get("name") or "Без названия"))
+        price = _price_value(product)
+        if price != float('inf'):
+            prices.append(price)
+            price_text = f"{price:,.2f}".replace(',', ' ').replace('.00', '') + " ₽"
+        else:
+            price_text = "цена не указана"
+        seller = product.get("seller") or {}
+        seller_name = html.escape(str(seller.get("username") or "не указан"))
+        slug = str(product.get("slug") or '').strip()
+        url = str(product.get("url") or '').strip()
+        if not url and slug:
+            url = f"https://playerok.com/products/{slug}"
+        title = f'<a href="{html.escape(url, quote=True)}">{name}</a>' if url else name
+        lines.append(f"{index}. {title}")
+        lines.append(f"   💵 <b>{price_text}</b> · продавец: {seller_name}")
+
+    if prices:
+        minimum = min(prices)
+        maximum = max(prices)
+        average = sum(prices) / len(prices)
+        lines.extend([
+            "",
+            f"📉 Минимум: <b>{minimum:.2f} ₽</b>",
+            f"📊 Средняя: <b>{average:.2f} ₽</b>",
+            f"📈 Максимум: <b>{maximum:.2f} ₽</b>"
+        ])
+    return '\n'.join(lines)
+
+
+@bot.message_handler(commands=['playerok'])
+@bot.message_handler(func=lambda message: message.text == '🛒 Playerok')
+def show_playerok_menu(message):
+    user_data = get_user_data(message.from_user.id)
+    game = _playerok_game(user_data)
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        types.KeyboardButton('🔎 Найти предмет'),
+        types.KeyboardButton('🎮 Выбрать игру'),
+        types.KeyboardButton('🏠 Главное меню')
+    )
+    bot.send_message(
+        message.chat.id,
+        f"🛒 *PLAYEROK*\n\nТекущая игра: *{game.get('name', 'SCraft')}*\n"
+        "Можно найти товар по названию и вывести от 1 до 10 самых дешёвых лотов.",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+
+@bot.message_handler(func=lambda message: message.text == '🎮 Выбрать игру')
+def ask_playerok_game(message):
+    msg = bot.send_message(message.chat.id, "Введите название игры, например: SCraft")
+    bot.register_next_step_handler(msg, process_playerok_game)
+
+
+def process_playerok_game(message):
+    query = (message.text or '').strip()
+    if len(query) < 2:
+        bot.reply_to(message, "❌ Название игры слишком короткое.")
+        return
+    try:
+        games = _collection(
+            playerok_client.search_games(query=query, limit=10),
+            "games", "results", "items"
+        )
+    except PlayerokApiError as exc:
+        bot.reply_to(message, f"❌ {exc}")
+        return
+    if not games:
+        bot.reply_to(message, "❌ Игра не найдена. Проверьте правильность названия.")
+        return
+
+    playerok_session[message.chat.id] = {"games": games}
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for index, game in enumerate(games[:10]):
+        markup.add(types.InlineKeyboardButton(
+            str(game.get("name") or "Без названия"),
+            callback_data=f"pok_game:{index}"
+        ))
+    bot.send_message(message.chat.id, "Выберите игру:", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('pok_game:'))
+def select_playerok_game(call):
+    try:
+        index = int(call.data.split(':', 1)[1])
+        game = playerok_session.get(call.message.chat.id, {}).get("games", [])[index]
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Список устарел. Повторите поиск.", show_alert=True)
+        return
+
+    user_data = get_user_data(call.from_user.id)
+    selected = _playerok_game(user_data)
+    selected.update({
+        "id": game.get("id"),
+        "name": game.get("name") or "Без названия",
+        "slug": game.get("slug"),
+        "items_category_id": _items_category_id(game)
+    })
+    save_user_data(call.from_user.id, user_data)
+    bot.answer_callback_query(call.id, "Игра выбрана")
+    bot.edit_message_text(
+        f"✅ Выбрана игра: <b>{html.escape(selected['name'])}</b>",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode='HTML'
+    )
+
+
+@bot.message_handler(func=lambda message: message.text == '🔎 Найти предмет')
+def ask_playerok_item(message):
+    msg = bot.send_message(
+        message.chat.id,
+        "Введите название предмета. Например: QBU 191"
+    )
+    bot.register_next_step_handler(msg, process_playerok_item_name)
+
+
+def process_playerok_item_name(message):
+    query = (message.text or '').strip()
+    if len(query) < 2:
+        bot.reply_to(message, "❌ Ошибка в названии: введите хотя бы 2 символа.")
+        return
+    playerok_session.setdefault(message.chat.id, {})["item_query"] = query
+    markup = types.InlineKeyboardMarkup(row_width=5)
+    buttons = [
+        types.InlineKeyboardButton(str(number), callback_data=f"pok_count:{number}")
+        for number in range(1, 11)
+    ]
+    markup.add(*buttons)
+    bot.send_message(
+        message.chat.id,
+        "Сколько лотов показать? Выберите от 1 до 10:",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('pok_count:'))
+def run_playerok_search(call):
+    bot.answer_callback_query(call.id)
+    try:
+        count = max(1, min(int(call.data.split(':', 1)[1]), 10))
+    except ValueError:
+        bot.send_message(call.message.chat.id, "❌ Некорректное количество лотов.")
+        return
+
+    query = playerok_session.get(call.message.chat.id, {}).get("item_query")
+    if not query:
+        bot.send_message(call.message.chat.id, "❌ Запрос устарел. Введите название ещё раз.")
+        return
+
+    progress = bot.send_message(call.message.chat.id, "⏳ Ищу актуальные лоты на Playerok...")
+    user_data = get_user_data(call.from_user.id)
+    try:
+        game, products, suggestions = search_playerok_products(user_data, query, count)
+        save_user_data(call.from_user.id, user_data)
+    except PlayerokApiError as exc:
+        bot.edit_message_text(f"❌ {exc}", progress.chat.id, progress.message_id)
+        return
+    except Exception as exc:
+        print(f"Ошибка поиска Playerok: {exc}")
+        bot.edit_message_text(
+            "❌ Не удалось обработать ответ Playerok. Попробуйте позже.",
+            progress.chat.id,
+            progress.message_id
+        )
+        return
+
+    if not products:
+        text = "❌ Товар не найден. Возможно, ошибка в названии."
+        if suggestions:
+            text += "\n\nВозможно, вы имели в виду:\n• " + "\n• ".join(
+                html.escape(name) for name in suggestions
+            )
+        bot.edit_message_text(text, progress.chat.id, progress.message_id, parse_mode='HTML')
+        return
+
+    bot.edit_message_text(
+        _format_playerok_results(game, query, products),
+        progress.chat.id,
+        progress.message_id,
+        parse_mode='HTML',
+        disable_web_page_preview=True
+    )
+
+
+# ============================================
 # ПОМОЩЬ И НАВИГАЦИЯ
 # ============================================
 
@@ -945,9 +1377,11 @@ def show_help(message):
         "💰 *Расчеты* - вычисление 26% и 6% от числа\n"
         "📋 *Лог* - хранение всех ваших записей с датами\n"
         "🎯 *Цель* - установка и отслеживание вашей цели\n"
-        "📊 *Статистика* - анализ ваших данных\n\n"
+        "📊 *Статистика* - анализ ваших данных\n"
+        "🛒 *Playerok* - поиск и сравнение актуальных лотов\n\n"
         "⚡ *Быстрые команды:*\n"
-        "/menu - Главное меню\n/calc - Калькулятор\n/log - Лог\n/goal - Цель\n/stats - Статистика\n/help - Помощь\n\n"
+        "/menu - Главное меню\n/calc - Калькулятор\n/log - Лог\n/goal - Цель\n/stats - Статистика\n"
+        "/playerok - Поиск товаров Playerok\n/help - Помощь\n\n"
         "👤 *Ваши данные изолированы* — другие пользователи не видят ваш лог и цели."
     )
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
@@ -966,6 +1400,7 @@ def back_to_main(message):
 def handle_unknown(message):
     if message.text and not message.text.startswith('/'):
         if message.text not in ['💰 Расчеты', '📋 Лог', '🎯 Цель', '📊 Статистика', 'ℹ️ Помощь',
+                                '🛒 Playerok', '🔎 Найти предмет', '🎮 Выбрать игру',
                                 '🔢 Ввести число', '📋 Добавить в лог',
                                 '📖 Просмотреть', '➕ Добавить', '🗑️ Удалить', '🧹 Очистить',
                                 '📊 Сумма', '📤 Экспорт', '🔍 Фильтр',
@@ -984,6 +1419,7 @@ def handle_unknown(message):
 
 user_state = {}
 temp_data = {}
+playerok_session = {}
 
 
 # ============================================
