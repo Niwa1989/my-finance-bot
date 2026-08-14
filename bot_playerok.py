@@ -1008,6 +1008,27 @@ class PlayerokClient:
             except Exception:
                 pass
         self._sessions.playerok = self._new_session()
+        self._sessions.primed = False
+
+    def _prime_session(self):
+        """Получает служебные cookies DDoS-Guard до запроса GraphQL."""
+        if getattr(self._sessions, "primed", False):
+            return
+        try:
+            self._session().get(
+                "https://playerok.com/",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+                },
+                timeout=PLAYEROK_TIMEOUT
+            )
+        except Exception as exc:
+            # Сам GraphQL-запрос всё равно выполняется: главная страница может
+            # быть недоступна отдельно от API.
+            print(f"Playerok bootstrap warning: {type(exc).__name__}: {exc}")
+        finally:
+            self._sessions.primed = True
 
     def _query(self, operation, variables):
         params = {
@@ -1020,34 +1041,49 @@ class PlayerokClient:
                 }
             }, separators=(',', ':'))
         }
+        headers = {
+            "Accept": "*/*",
+            "Apollo-Require-Preflight": "true",
+            "Apollographql-Client-Name": "web",
+            "Origin": "https://playerok.com",
+            "Referer": "https://playerok.com/",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "X-GQL-Op": operation,
+            "X-GQL-Path": "/",
+            "X-Apollo-Operation-Name": operation,
+            "X-Timezone-Offset": "-600"
+        }
+        # При curl_cffi User-Agent должен соответствовать выбранному TLS-профилю,
+        # поэтому библиотека выставляет его сама.
+        if CurlSession is None:
+            headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            )
+
+        self._prime_session()
         response = None
         for attempt in range(PLAYEROK_API_RETRIES):
             try:
                 response = self._session().get(
                     PLAYEROK_GRAPHQL_URL,
-                    headers={
-                        "Accept": "*/*",
-                        "Apollo-Require-Preflight": "true",
-                        "Apollographql-Client-Name": "web",
-                        "Origin": "https://playerok.com",
-                        "Referer": "https://playerok.com/",
-                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                        "Sec-Fetch-Dest": "empty",
-                        "Sec-Fetch-Mode": "cors",
-                        "Sec-Fetch-Site": "same-origin",
-                        "X-GQL-Op": operation,
-                        "X-GQL-Path": "/",
-                        "X-Apollo-Operation-Name": operation,
-                        "X-Timezone-Offset": "-600",
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/146.0.0.0 Safari/537.36"
-                        )
-                    },
+                    headers=headers,
                     params=params,
                     timeout=PLAYEROK_TIMEOUT
                 )
+                if response.status_code in (401, 403):
+                    # Первый отказ часто устанавливает недостающие cookies.
+                    time.sleep(0.25)
+                    response = self._session().get(
+                        PLAYEROK_GRAPHQL_URL,
+                        headers=headers,
+                        params=params,
+                        timeout=PLAYEROK_TIMEOUT
+                    )
             except Exception as exc:
                 self._reset_session()
                 if attempt + 1 == PLAYEROK_API_RETRIES:
@@ -1069,7 +1105,15 @@ class PlayerokClient:
         if response.status_code == 429:
             raise PlayerokApiError("Playerok ограничил частоту запросов. Попробуйте позже.")
         if response.status_code in (401, 403):
-            raise PlayerokApiError("Playerok отклонил запрос к публичному каталогу.")
+            trace_id = response.headers.get("x-trace-id", "нет")
+            print(
+                f"Playerok access denied: operation={operation}, "
+                f"status={response.status_code}, server={response.headers.get('server')}, "
+                f"trace={trace_id}, body={response.text[:500]}"
+            )
+            raise PlayerokApiError(
+                "Playerok ограничил доступ с IP Render (403). Попробуйте ещё раз позже."
+            )
         if response.status_code in (502, 503, 504):
             print(
                 f"Playerok временно недоступен: operation={operation}, "
