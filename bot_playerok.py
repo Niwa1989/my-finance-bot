@@ -6,8 +6,9 @@ import threading
 import difflib
 import html
 import re
+import hashlib
 from datetime import datetime, timedelta
-from flask import Flask
+from flask import Flask, request, abort
 import telebot
 import requests
 from telebot import types
@@ -33,6 +34,7 @@ app = Flask(__name__)
 # Хэши запросов взяты из PlayerokAPI: https://github.com/alleexxeeyy/PlayerokAPI
 # Авторизация и PARSE_API_KEY для просмотра публичных лотов не нужны.
 PLAYEROK_GRAPHQL_URL = 'https://playerok.com/graphql'
+PLAYEROK_PROXY = os.environ.get('PLAYEROK_PROXY')
 PLAYEROK_QUERY_HASHES = {
     'games': '5de9b3240c148579c82e2310a30b4aad5462884fd1abf93dd3c43d1f5ef14d85',
     'items': '3f20c731f8f769a094ee3fa32e09f8e12250357e9a4f0ebb4e6988e7a0bb9260'
@@ -990,8 +992,15 @@ class PlayerokClient:
 
     def _new_session(self):
         if CurlSession is not None:
-            return CurlSession(impersonate="chrome")
-        return requests.Session()
+            return CurlSession(
+                impersonate="chrome",
+                proxy=PLAYEROK_PROXY or None,
+                timeout=PLAYEROK_TIMEOUT
+            )
+        session = requests.Session()
+        if PLAYEROK_PROXY:
+            session.proxies.update({"http": PLAYEROK_PROXY, "https": PLAYEROK_PROXY})
+        return session
 
     def _session(self):
         session = getattr(self._sessions, "playerok", None)
@@ -1111,9 +1120,14 @@ class PlayerokClient:
                 f"status={response.status_code}, server={response.headers.get('server')}, "
                 f"trace={trace_id}, body={response.text[:500]}"
             )
-            raise PlayerokApiError(
-                "Playerok ограничил доступ с IP Render (403). Попробуйте ещё раз позже."
-            )
+            if PLAYEROK_PROXY:
+                message = "Playerok отклонил IP настроенного прокси (403)."
+            else:
+                message = (
+                    "Playerok блокирует IP Render (403). "
+                    "Настройте переменную PLAYEROK_PROXY."
+                )
+            raise PlayerokApiError(message)
         if response.status_code in (502, 503, 504):
             print(
                 f"Playerok временно недоступен: operation={operation}, "
@@ -1737,15 +1751,19 @@ def health():
 
 
 # ============================================
-# УДАЛЕНИЕ ВЕБ-ХУКА ПРИ ЗАПУСКЕ (для Render)
+# TELEGRAM WEBHOOK (Render)
 # ============================================
 
-# Удаляем веб-хук при запуске (для Render)
-try:
-    bot.delete_webhook()
-    print("✅ Веб-хук удалён при запуске")
-except Exception as e:
-    print(f"Ошибка удаления веб-хука: {e}")
+TELEGRAM_WEBHOOK_SECRET = hashlib.sha256((TOKEN or '').encode('utf-8')).hexdigest()
+
+
+@app.route('/telegram-webhook', methods=['POST'])
+def telegram_webhook():
+    if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != TELEGRAM_WEBHOOK_SECRET:
+        abort(403)
+    update = telebot.types.Update.de_json(request.get_json(force=True))
+    bot.process_new_updates([update])
+    return "OK"
 
 # ============================================
 # ЗАПУСК (для Render — в отдельном потоке)
@@ -1756,20 +1774,37 @@ if __name__ == '__main__':
     data = load_data()
     print(f"📁 Всего пользователей: {len(data.get('users', {}))}")
 
+    render_hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME', '').strip()
+    public_url = (
+        os.environ.get('WEBHOOK_URL')
+        or os.environ.get('RENDER_EXTERNAL_URL')
+        or (f"https://{render_hostname}" if render_hostname else '')
+    ).rstrip('/')
+    if public_url:
+        try:
+            bot.remove_webhook()
+            bot.set_webhook(
+                url=f"{public_url}/telegram-webhook",
+                secret_token=TELEGRAM_WEBHOOK_SECRET,
+                drop_pending_updates=False
+            )
+            print(f"✅ Telegram webhook установлен: {public_url}/telegram-webhook")
+        except Exception as exc:
+            print(f"❌ Не удалось установить Telegram webhook: {exc}")
+            raise
+    else:
+        # Локальный запуск без публичного HTTPS-адреса.
+        bot.remove_webhook()
 
-    # Запускаем бота в отдельном потоке
-    def run_bot():
-        while True:
+        def run_bot():
             try:
-                bot.polling(none_stop=True, timeout=60)
-            except Exception as e:
-                print(f"❌ Ошибка: {e}")
-                time.sleep(5)
+                bot.infinity_polling(timeout=30, long_polling_timeout=30)
+            except Exception as exc:
+                print(f"❌ Telegram polling остановлен: {exc}")
 
-
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
+        bot_thread = threading.Thread(target=run_bot, daemon=True)
+        bot_thread.start()
+        print("✅ Telegram polling запущен локально")
 
     # Запускаем Flask для health checks
     port = int(os.environ.get('PORT', 5000))
