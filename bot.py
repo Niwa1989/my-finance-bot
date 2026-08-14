@@ -982,17 +982,6 @@ class PlayerokClient:
                 "Не задан PARSE_API_KEY. Добавьте его в переменные окружения Render."
             )
 
-        try:
-            response = self.session.get(
-                f"{PLAYEROK_API_URL}/{endpoint}",
-                headers={"X-API-Key": self.api_key, "Accept": "application/json"},
-                params={key: value for key, value in params.items() if value is not None},
-                timeout=PLAYEROK_TIMEOUT
-            )
-        except requests.Timeout as exc:
-            raise PlayerokApiError("Playerok отвечает слишком долго. Попробуйте ещё раз.") from exc
-        except requests.RequestException as exc:
-            raise PlayerokApiError("Не удалось подключиться к каталогу Playerok.") from exc
         response = None
         for attempt in range(PLAYEROK_API_RETRIES):
             try:
@@ -1105,15 +1094,12 @@ def _normalize_search_text(value):
     return ' '.join(re.findall(r'[a-zа-я0-9]+', value, flags=re.IGNORECASE))
 
 
-def _items_category_id(game):
 def _default_playerok_category(game):
     categories = game.get("categories") or []
     for category in categories:
         name = _normalize_search_text(category.get("name"))
         slug = _normalize_search_text(category.get("slug"))
         if "предмет" in name or slug in {"items", "item"}:
-            return category.get("id")
-    return None
             return category
     return categories[0] if categories else None
 
@@ -1162,7 +1148,6 @@ def _select_playerok_game(user_data, game):
 
 def _resolve_game(user_data):
     selected = _playerok_game(user_data)
-    if selected.get("id"):
     category = _playerok_category(user_data)
     if selected.get("id") and category.get("id"):
         return selected
@@ -1180,13 +1165,6 @@ def _resolve_game(user_data):
             len(_normalize_search_text(entry.get("name")))
         )
     )
-    selected.update({
-        "id": game.get("id"),
-        "name": game.get("name") or selected.get("name"),
-        "slug": game.get("slug") or selected.get("slug"),
-        "items_category_id": _items_category_id(game)
-    })
-    return selected
     return _select_playerok_game(user_data, game)
 
 
@@ -1223,7 +1201,6 @@ def search_playerok_products(user_data, query, count):
     for _ in range(PLAYEROK_SEARCH_PAGES):
         payload = playerok_client.list_items(
             game_id=game.get("id"),
-            game_category_id=game.get("items_category_id"),
             game_category_id=category.get("id"),
             cursor=cursor,
             limit=50
@@ -1268,11 +1245,9 @@ def search_playerok_products(user_data, query, count):
         )
         suggestions = [normalized_to_original[name] for name in close]
 
-    return game, matches[:count], suggestions
     return game, category, matches[:count], suggestions
 
 
-def _format_playerok_results(game, query, products):
 def _format_playerok_results(game, category, query, products):
     lines = [
         f"🛒 <b>{html.escape(game.get('name') or 'Playerok')}</b>",
@@ -1321,7 +1296,6 @@ def show_playerok_menu(message):
     category = _playerok_category(user_data)
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add(
-        types.KeyboardButton('🔎 Найти предмет'),
         types.KeyboardButton('🔎 Найти товар'),
         types.KeyboardButton('🎮 Выбрать игру'),
         types.KeyboardButton('📂 Выбрать категорию'),
@@ -1459,19 +1433,13 @@ def select_playerok_category(call):
     user_data = get_user_data(call.from_user.id)
     selected = _playerok_category(user_data)
     selected.update({
-        "id": game.get("id"),
-        "name": game.get("name") or "Без названия",
-        "slug": game.get("slug"),
-        "items_category_id": _items_category_id(game)
         "id": category.get("id"),
         "name": category.get("name") or "Без категории",
         "slug": category.get("slug")
     })
     save_user_data(call.from_user.id, user_data)
-    bot.answer_callback_query(call.id, "Игра выбрана")
     bot.answer_callback_query(call.id, "Категория выбрана")
     bot.edit_message_text(
-        f"✅ Выбрана игра: <b>{html.escape(selected['name'])}</b>",
         f"✅ Выбрана категория: <b>{html.escape(selected['name'])}</b>",
         call.message.chat.id,
         call.message.message_id,
@@ -1479,12 +1447,10 @@ def select_playerok_category(call):
     )
 
 
-@bot.message_handler(func=lambda message: message.text == '🔎 Найти предмет')
 @bot.message_handler(func=lambda message: message.text in ('🔎 Найти товар', '🔎 Найти предмет'))
 def ask_playerok_item(message):
     msg = bot.send_message(
         message.chat.id,
-        "Введите название предмета. Например: QBU 191"
         "Введите название товара в выбранной категории. Например: QBU 191"
     )
     bot.register_next_step_handler(msg, process_playerok_item_name)
@@ -1526,7 +1492,6 @@ def run_playerok_search(call):
     progress = bot.send_message(call.message.chat.id, "⏳ Ищу актуальные лоты на Playerok...")
     user_data = get_user_data(call.from_user.id)
     try:
-        game, products, suggestions = search_playerok_products(user_data, query, count)
         game, category, products, suggestions = search_playerok_products(user_data, query, count)
         save_user_data(call.from_user.id, user_data)
     except PlayerokApiError as exc:
@@ -1551,7 +1516,6 @@ def run_playerok_search(call):
         return
 
     bot.edit_message_text(
-        _format_playerok_results(game, query, products),
         _format_playerok_results(game, category, query, products),
         progress.chat.id,
         progress.message_id,
@@ -1595,7 +1559,6 @@ def back_to_main(message):
 def handle_unknown(message):
     if message.text and not message.text.startswith('/'):
         if message.text not in ['💰 Расчеты', '📋 Лог', '🎯 Цель', '📊 Статистика', 'ℹ️ Помощь',
-                                '🛒 Playerok', '🔎 Найти предмет', '🎮 Выбрать игру',
                                 '🛒 Playerok', '🔎 Найти товар', '🔎 Найти предмет',
                                 '🎮 Выбрать игру', '📂 Выбрать категорию',
                                 '🔢 Ввести число', '📋 Добавить в лог',
