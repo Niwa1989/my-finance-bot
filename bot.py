@@ -17,7 +17,9 @@ from telebot import types
 # ============================================
 
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
-bot = telebot.TeleBot(TOKEN)
+# Сетевые запросы Playerok могут ожидать внешний API. Дополнительные рабочие
+# потоки не дают им блокировать обычные кнопки финансового бота.
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8)
 app = Flask(__name__)
 
 # Playerok не публикует официальный API для каталога. Используется поддерживаемый
@@ -27,10 +29,10 @@ PLAYEROK_API_URL = (
     'https://api.parse.bot/scraper/'
     '4688010c-bf13-44a2-bef6-4db5e643b286'
 )
-PLAYEROK_TIMEOUT = int(os.environ.get('PLAYEROK_TIMEOUT', '30'))
+PLAYEROK_TIMEOUT = int(os.environ.get('PLAYEROK_TIMEOUT', '12'))
 PLAYEROK_SEARCH_PAGES = max(1, min(int(os.environ.get('PLAYEROK_SEARCH_PAGES', '4')), 10))
 PLAYEROK_API_SNAPSHOT_VERSION = os.environ.get('PLAYEROK_API_SNAPSHOT_VERSION', '4')
-PLAYEROK_API_RETRIES = max(1, min(int(os.environ.get('PLAYEROK_API_RETRIES', '3')), 5))
+PLAYEROK_API_RETRIES = max(1, min(int(os.environ.get('PLAYEROK_API_RETRIES', '2')), 5))
 
 # Пути к данным
 DATA_FILE = 'bot_data.json'
@@ -1313,6 +1315,7 @@ def show_playerok_menu(message):
 
 @bot.message_handler(func=lambda message: message.text == '🎮 Выбрать игру')
 def ask_playerok_game(message):
+    bot.clear_step_handler_by_chat_id(message.chat.id)
     msg = bot.send_message(message.chat.id, "Введите название игры, например: SCraft")
     bot.register_next_step_handler(msg, process_playerok_game)
 
@@ -1322,16 +1325,21 @@ def process_playerok_game(message):
     if len(query) < 2:
         bot.reply_to(message, "❌ Название игры слишком короткое.")
         return
+    progress = bot.send_message(message.chat.id, "⏳ Ищу игру на Playerok...")
     try:
         games = _collection(
             playerok_client.search_games(query=query, limit=10),
             "games", "results", "items"
         )
     except PlayerokApiError as exc:
-        bot.reply_to(message, f"❌ {exc}")
+        bot.edit_message_text(f"❌ {exc}", progress.chat.id, progress.message_id)
         return
     if not games:
-        bot.reply_to(message, "❌ Игра не найдена. Проверьте правильность названия.")
+        bot.edit_message_text(
+            "❌ Игра не найдена. Проверьте правильность названия.",
+            progress.chat.id,
+            progress.message_id
+        )
         return
 
     playerok_session[message.chat.id] = {"games": games}
@@ -1341,7 +1349,12 @@ def process_playerok_game(message):
             str(game.get("name") or "Без названия"),
             callback_data=f"pok_game:{index}"
         ))
-    bot.send_message(message.chat.id, "Выберите игру:", reply_markup=markup)
+    bot.edit_message_text(
+        "Выберите игру:",
+        progress.chat.id,
+        progress.message_id,
+        reply_markup=markup
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('pok_game:'))
@@ -1371,6 +1384,7 @@ def select_playerok_game(call):
 def choose_playerok_category(message):
     user_data = get_user_data(message.from_user.id)
     selected = _playerok_game(user_data)
+    progress = bot.send_message(message.chat.id, "⏳ Загружаю категории Playerok...")
     try:
         payload = playerok_client.search_games(
             query=selected.get("name") or "SCraft",
@@ -1378,7 +1392,7 @@ def choose_playerok_category(message):
         )
         games = _collection(payload, "games", "results", "items")
     except PlayerokApiError as exc:
-        bot.reply_to(message, f"❌ {exc}")
+        bot.edit_message_text(f"❌ {exc}", progress.chat.id, progress.message_id)
         return
 
     selected_id = selected.get("id")
@@ -1398,7 +1412,11 @@ def choose_playerok_category(message):
 
     categories = game.get("categories") if game else []
     if not categories:
-        bot.reply_to(message, "❌ Для этой игры категории не найдены.")
+        bot.edit_message_text(
+            "❌ Для этой игры категории не найдены.",
+            progress.chat.id,
+            progress.message_id
+        )
         return
 
     playerok_session.setdefault(message.chat.id, {})["categories"] = categories
@@ -1408,9 +1426,10 @@ def choose_playerok_category(message):
             str(category.get("name") or "Без категории"),
             callback_data=f"pok_category:{index}"
         ))
-    bot.send_message(
-        message.chat.id,
+    bot.edit_message_text(
         f"📂 Выберите категорию для {selected.get('name', 'игры')}:",
+        progress.chat.id,
+        progress.message_id,
         reply_markup=markup
     )
 
@@ -1449,6 +1468,7 @@ def select_playerok_category(call):
 
 @bot.message_handler(func=lambda message: message.text in ('🔎 Найти товар', '🔎 Найти предмет'))
 def ask_playerok_item(message):
+    bot.clear_step_handler_by_chat_id(message.chat.id)
     msg = bot.send_message(
         message.chat.id,
         "Введите название товара в выбранной категории. Например: QBU 191"
