@@ -12,6 +12,13 @@ import telebot
 import requests
 from telebot import types
 
+try:
+    # Playerok защищён DDoS-Guard и на серверных IP обычный requests иногда
+    # зависает. curl_cffi повторяет TLS-отпечаток настоящего Chrome.
+    from curl_cffi.requests import Session as CurlSession
+except ImportError:
+    CurlSession = None
+
 # ============================================
 # КОНФИГУРАЦИЯ
 # ============================================
@@ -39,11 +46,11 @@ PLAYEROK_QUERY_HASHES = {
     'games': '5de9b3240c148579c82e2310a30b4aad5462884fd1abf93dd3c43d1f5ef14d85',
     'items': '3f20c731f8f769a094ee3fa32e09f8e12250357e9a4f0ebb4e6988e7a0bb9260'
 }
-PLAYEROK_TIMEOUT = int(os.environ.get('PLAYEROK_TIMEOUT', '12'))
+PLAYEROK_TIMEOUT = int(os.environ.get('PLAYEROK_TIMEOUT', '15'))
 PLAYEROK_SEARCH_PAGES = max(1, min(int(os.environ.get('PLAYEROK_SEARCH_PAGES', '4')), 10))
 PLAYEROK_API_SNAPSHOT_VERSION = os.environ.get('PLAYEROK_API_SNAPSHOT_VERSION', '4')
 PLAYEROK_API_RETRIES = max(1, min(int(os.environ.get('PLAYEROK_API_RETRIES', '3')), 5))
-PLAYEROK_API_RETRIES = max(1, min(int(os.environ.get('PLAYEROK_API_RETRIES', '2')), 5))
+PLAYEROK_API_RETRIES = max(1, min(int(os.environ.get('PLAYEROK_API_RETRIES', '1')), 5))
 
 # Пути к данным
 DATA_FILE = 'bot_data.json'
@@ -987,16 +994,39 @@ class PlayerokApiError(RuntimeError):
 class PlayerokClient:
     def __init__(self, api_key=None):
         self.api_key = api_key or PLAYEROK_API_KEY
-    """Клиент публичного каталога Playerok без авторизации в аккаунте."""
-
-    def __init__(self):
         self.session = requests.Session()
+    """Клиент публичного каталога Playerok без авторизации в аккаунте."""
 
     def _get(self, endpoint, **params):
         if not self.api_key:
             raise PlayerokApiError(
                 "Не задан PARSE_API_KEY. Добавьте его в переменные окружения Render."
             )
+    def __init__(self):
+        # TeleBot работает в нескольких потоках. Отдельная сессия на поток
+        # исключает одновременное использование одного HTTP-соединения.
+        self._sessions = threading.local()
+
+    def _new_session(self):
+        if CurlSession is not None:
+            return CurlSession(impersonate="chrome")
+        return requests.Session()
+
+    def _session(self):
+        session = getattr(self._sessions, "playerok", None)
+        if session is None:
+            session = self._new_session()
+            self._sessions.playerok = session
+        return session
+
+    def _reset_session(self):
+        session = getattr(self._sessions, "playerok", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        self._sessions.playerok = self._new_session()
 
     def _query(self, operation, variables):
         params = {
@@ -1014,6 +1044,7 @@ class PlayerokClient:
             try:
                 response = self.session.get(
                     f"{PLAYEROK_API_URL}/{endpoint}",
+                response = self._session().get(
                     PLAYEROK_GRAPHQL_URL,
                     headers={
                         "X-API-Key": self.api_key,
@@ -1024,11 +1055,18 @@ class PlayerokClient:
                         "Apollographql-Client-Name": "web",
                         "Origin": "https://playerok.com",
                         "Referer": "https://playerok.com/",
+                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
                         "X-GQL-Op": operation,
+                        "X-GQL-Path": "/",
                         "X-Apollo-Operation-Name": operation,
+                        "X-Timezone-Offset": "-600",
                         "User-Agent": (
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 Chrome/143.0 Safari/537.36"
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/146.0.0.0 Safari/537.36"
                         )
                     },
                     params={key: value for key, value in params.items() if value is not None},
@@ -1036,9 +1074,14 @@ class PlayerokClient:
                     timeout=PLAYEROK_TIMEOUT
                 )
             except requests.Timeout as exc:
+            except Exception as exc:
+                self._reset_session()
                 if attempt + 1 == PLAYEROK_API_RETRIES:
+                    error_name = type(exc).__name__
+                    print(f"Playerok transport error ({operation}): {error_name}: {exc}")
                     raise PlayerokApiError(
                         "Playerok отвечает слишком долго. Попробуйте ещё раз."
+                        "Не удалось подключиться к Playerok с сервера Render."
                     ) from exc
                 time.sleep(1 + attempt)
                 continue
