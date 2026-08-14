@@ -16,18 +16,19 @@ TOKEN = os.environ.get('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-# Пути к данным (Render использует временную файловую систему)
+# Пути к данным
 DATA_FILE = 'bot_data.json'
 BACKUP_DIR = 'backups'
 
 if not os.path.exists(BACKUP_DIR):
     os.makedirs(BACKUP_DIR)
 
+
 # ============================================
-# СИСТЕМА ХРАНЕНИЯ ДАННЫХ
+# РАБОТА С ДАННЫМИ ПОЛЬЗОВАТЕЛЕЙ
 # ============================================
 
-def get_default_data():
+def get_default_user_data():
     return {
         "log": [],
         "goal": None,
@@ -35,24 +36,26 @@ def get_default_data():
         "settings": {"last_id": 0}
     }
 
+
+def get_default_data():
+    return {
+        "users": {}
+    }
+
+
 def load_data():
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                if 'goal_date' not in data:
-                    data['goal_date'] = None
-                if 'settings' not in data:
-                    data['settings'] = {"last_id": 0}
-                if 'last_id' not in data['settings']:
-                    data['settings']['last_id'] = 0
-                if 'log' not in data:
-                    data['log'] = []
+                if 'users' not in data:
+                    data['users'] = {}
                 return data
         except Exception as e:
             print(f"Ошибка загрузки данных: {e}")
             return get_default_data()
     return get_default_data()
+
 
 def save_data(data):
     try:
@@ -66,25 +69,36 @@ def save_data(data):
         print(f"Ошибка сохранения данных: {e}")
         return False
 
-def get_next_id(data):
+
+def get_user_data(user_id):
+    """Получает данные пользователя, если нет — создаёт"""
+    data = load_data()
+    user_id_str = str(user_id)
+    if user_id_str not in data['users']:
+        data['users'][user_id_str] = get_default_user_data()
+        save_data(data)
+    return data['users'][user_id_str]
+
+
+def save_user_data(user_id, user_data):
+    """Сохраняет данные пользователя"""
+    data = load_data()
+    data['users'][str(user_id)] = user_data
+    save_data(data)
+
+
+def get_next_id(user_data):
     try:
-        if 'settings' not in data:
-            data['settings'] = {"last_id": 0}
-        if 'last_id' not in data['settings']:
-            data['settings']['last_id'] = 0
-        data['settings']['last_id'] += 1
-        return data['settings']['last_id']
+        if 'settings' not in user_data:
+            user_data['settings'] = {"last_id": 0}
+        if 'last_id' not in user_data['settings']:
+            user_data['settings']['last_id'] = 0
+        user_data['settings']['last_id'] += 1
+        return user_data['settings']['last_id']
     except Exception as e:
         print(f"Ошибка в get_next_id: {e}")
-        return len(data.get('log', [])) + 1
+        return len(user_data.get('log', [])) + 1
 
-# ============================================
-# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-# ============================================
-
-data = load_data()
-user_state = {}
-temp_data = {}
 
 # ============================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -93,18 +107,22 @@ temp_data = {}
 def format_number(number):
     return f"{number:.2f}"
 
+
 def get_date_now():
     return datetime.now().strftime('%d.%m.%Y %H:%M')
 
+
 def get_date_only():
     return datetime.now().strftime('%d.%m.%Y')
+
 
 def create_progress_bar(progress, length=20):
     filled = int((progress / 100) * length)
     return "█" * filled + "░" * (length - filled)
 
-def get_log_summary(data):
-    log = data.get('log', [])
+
+def get_log_summary(user_data):
+    log = user_data.get('log', [])
     if not log:
         return 0, 0, 0, 0, 0
     total = sum(entry.get('amount', 0) for entry in log)
@@ -114,12 +132,15 @@ def get_log_summary(data):
     min_amount = min(entry.get('amount', 0) for entry in log) if log else 0
     return total, count, avg, max_amount, min_amount
 
+
 # ============================================
 # ГЛАВНОЕ МЕНЮ
 # ============================================
 
 @bot.message_handler(commands=['start', 'menu'])
 def show_main_menu(message):
+    user_data = get_user_data(message.from_user.id)
+
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton('💰 Расчеты')
     btn2 = types.KeyboardButton('📋 Лог')
@@ -134,6 +155,7 @@ def show_main_menu(message):
         parse_mode='Markdown'
     )
 
+
 # ============================================
 # БЫСТРЫЕ КОМАНДЫ
 # ============================================
@@ -142,21 +164,26 @@ def show_main_menu(message):
 def quick_calc(message):
     show_calc_menu(message)
 
+
 @bot.message_handler(commands=['log'])
 def quick_log(message):
     show_log_menu(message)
+
 
 @bot.message_handler(commands=['goal'])
 def quick_goal(message):
     show_goal_menu(message)
 
+
 @bot.message_handler(commands=['stats'])
 def quick_stats(message):
     show_stats_menu(message)
 
+
 @bot.message_handler(commands=['help'])
 def quick_help(message):
     show_help(message)
+
 
 # ============================================
 # РЕЖИМ РАСЧЕТОВ
@@ -179,13 +206,16 @@ def show_calc_menu(message):
         parse_mode='Markdown'
     )
 
-@bot.message_handler(func=lambda message: message.text == '🔢 Ввести число' and user_state.get(message.chat.id) == 'calc')
+
+@bot.message_handler(
+    func=lambda message: message.text == '🔢 Ввести число' and user_state.get(message.chat.id) == 'calc')
 def ask_for_number(message):
     msg = bot.send_message(
         message.chat.id,
         "Введите число или несколько чисел через запятую:\n📌 Пример: 1200, 1500, 1221, 10004"
     )
     bot.register_next_step_handler(msg, process_number_calc)
+
 
 def process_number_calc(message):
     try:
@@ -207,6 +237,7 @@ def process_number_calc(message):
         process_single_number(message, number)
     except ValueError:
         bot.reply_to(message, "❌ Пожалуйста, введите корректные числа!")
+
 
 def process_single_number(message, number):
     temp_data[message.chat.id] = number
@@ -237,7 +268,9 @@ def process_single_number(message, number):
         parse_mode='Markdown'
     )
 
-@bot.message_handler(func=lambda message: message.text == '📋 Добавить в лог' and user_state.get(message.chat.id) == 'calc')
+
+@bot.message_handler(
+    func=lambda message: message.text == '📋 Добавить в лог' and user_state.get(message.chat.id) == 'calc')
 def add_custom_to_log(message):
     msg = bot.send_message(
         message.chat.id,
@@ -245,52 +278,60 @@ def add_custom_to_log(message):
     )
     bot.register_next_step_handler(msg, process_custom_log)
 
+
 def process_custom_log(message):
     try:
         parts = message.text.split(' ', 1)
         amount = float(parts[0].replace(',', '').replace(' ', ''))
         description = parts[1] if len(parts) > 1 else "Ручной ввод"
-        data = load_data()
+
+        user_data = get_user_data(message.from_user.id)
         entry = {
-            "id": get_next_id(data),
+            "id": get_next_id(user_data),
             "date": get_date_now(),
             "amount": amount,
             "type": "manual",
             "original_amount": amount,
             "description": description
         }
-        data['log'].append(entry)
-        save_data(data)
+        user_data['log'].append(entry)
+        save_user_data(message.from_user.id, user_data)
+
         bot.send_message(
             message.chat.id,
-            f"✅ Сумма *{format_number(amount)}* добавлена в лог!\n📝 Описание: {description}",
+            f"✅ Сумма *{format_number(amount)}* добавлена в ваш лог!\n📝 Описание: {description}",
             parse_mode='Markdown'
         )
     except ValueError:
         bot.reply_to(message, "❌ Пожалуйста, введите корректную сумму!")
 
+
 # ============================================
 # ОБРАБОТЧИКИ ИНЛАЙН КНОПОК
 # ============================================
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('add_26_') or call.data.startswith('add_6_') or call.data.startswith('add_both_'))
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith('add_26_') or call.data.startswith('add_6_') or call.data.startswith(
+        'add_both_'))
 def handle_add_to_log(call):
     try:
-        data = load_data()
-        if 'settings' not in data:
-            data['settings'] = {"last_id": 0}
-        if 'last_id' not in data['settings']:
-            data['settings']['last_id'] = 0
+        user_data = get_user_data(call.from_user.id)
+        if 'settings' not in user_data:
+            user_data['settings'] = {"last_id": 0}
+        if 'last_id' not in user_data['settings']:
+            user_data['settings']['last_id'] = 0
 
         if call.data.startswith('add_both_'):
             number = float(call.data.replace('add_both_', ''))
             result_26 = number * 0.74
             result_6 = number * 0.94
-            entry1 = {"id": get_next_id(data), "date": get_date_now(), "amount": result_26, "type": "26%", "original_amount": number, "description": "Чистая прибыль (26%)"}
-            entry2 = {"id": get_next_id(data), "date": get_date_now(), "amount": result_6, "type": "6%", "original_amount": number, "description": "С комиссией (6%)"}
-            data['log'].append(entry1)
-            data['log'].append(entry2)
-            save_data(data)
+            entry1 = {"id": get_next_id(user_data), "date": get_date_now(), "amount": result_26, "type": "26%",
+                      "original_amount": number, "description": "Чистая прибыль (26%)"}
+            entry2 = {"id": get_next_id(user_data), "date": get_date_now(), "amount": result_6, "type": "6%",
+                      "original_amount": number, "description": "С комиссией (6%)"}
+            user_data['log'].append(entry1)
+            user_data['log'].append(entry2)
+            save_user_data(call.from_user.id, user_data)
             bot.edit_message_text(
                 f"✅ Добавлены оба варианта:\n26%: *{format_number(result_26)}*\n6%: *{format_number(result_6)}*",
                 call.message.chat.id, call.message.message_id, parse_mode='Markdown'
@@ -298,21 +339,23 @@ def handle_add_to_log(call):
         elif call.data.startswith('add_26_'):
             number = float(call.data.replace('add_26_', ''))
             result = number * 0.74
-            entry = {"id": get_next_id(data), "date": get_date_now(), "amount": result, "type": "26%", "original_amount": number, "description": "Чистая прибыль (26%)"}
-            data['log'].append(entry)
-            save_data(data)
+            entry = {"id": get_next_id(user_data), "date": get_date_now(), "amount": result, "type": "26%",
+                     "original_amount": number, "description": "Чистая прибыль (26%)"}
+            user_data['log'].append(entry)
+            save_user_data(call.from_user.id, user_data)
             bot.edit_message_text(
-                f"✅ Добавлено в лог:\nСумма: *{format_number(result)}* (26% от {format_number(number)})",
+                f"✅ Добавлено в ваш лог:\nСумма: *{format_number(result)}* (26% от {format_number(number)})",
                 call.message.chat.id, call.message.message_id, parse_mode='Markdown'
             )
         elif call.data.startswith('add_6_'):
             number = float(call.data.replace('add_6_', ''))
             result = number * 0.94
-            entry = {"id": get_next_id(data), "date": get_date_now(), "amount": result, "type": "6%", "original_amount": number, "description": "С комиссией (6%)"}
-            data['log'].append(entry)
-            save_data(data)
+            entry = {"id": get_next_id(user_data), "date": get_date_now(), "amount": result, "type": "6%",
+                     "original_amount": number, "description": "С комиссией (6%)"}
+            user_data['log'].append(entry)
+            save_user_data(call.from_user.id, user_data)
             bot.edit_message_text(
-                f"✅ Добавлено в лог:\nСумма: *{format_number(result)}* (6% от {format_number(number)})",
+                f"✅ Добавлено в ваш лог:\nСумма: *{format_number(result)}* (6% от {format_number(number)})",
                 call.message.chat.id, call.message.message_id, parse_mode='Markdown'
             )
         bot.answer_callback_query(call.id, "✅ Добавлено в лог")
@@ -323,6 +366,7 @@ def handle_add_to_log(call):
         except:
             pass
 
+
 # ============================================
 # РЕЖИМ ЛОГА
 # ============================================
@@ -330,6 +374,8 @@ def handle_add_to_log(call):
 @bot.message_handler(func=lambda message: message.text == '📋 Лог')
 def show_log_menu(message):
     user_state[message.chat.id] = 'log'
+    user_data = get_user_data(message.from_user.id)
+
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton('📖 Просмотреть')
     btn2 = types.KeyboardButton('➕ Добавить')
@@ -341,24 +387,24 @@ def show_log_menu(message):
     btn8 = types.KeyboardButton('🏠 Главное меню')
     markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8)
 
-    data = load_data()
-    total, count, _, _, _ = get_log_summary(data)
+    total, count, _, _, _ = get_log_summary(user_data)
     bot.send_message(
         message.chat.id,
-        f"📋 *ЛОГ*\n\n📊 Всего записей: *{count}*\n💰 Общая сумма: *{format_number(total)}*\n\nВыберите действие:",
+        f"📋 *ВАШ ЛОГ*\n\n📊 Всего записей: *{count}*\n💰 Общая сумма: *{format_number(total)}*\n\nВыберите действие:",
         reply_markup=markup,
         parse_mode='Markdown'
     )
 
+
 @bot.message_handler(func=lambda message: message.text == '📖 Просмотреть' and user_state.get(message.chat.id) == 'log')
 def view_log(message):
-    data = load_data()
-    log = data['log']
+    user_data = get_user_data(message.from_user.id)
+    log = user_data['log']
     if not log:
-        bot.reply_to(message, "📭 Лог пуст")
+        bot.reply_to(message, "📭 Ваш лог пуст")
         return
 
-    log_text = "📋 *ЛОГ (все записи)*\n" + "═" * 30 + "\n\n"
+    log_text = "📋 *ВАШ ЛОГ (все записи)*\n" + "═" * 30 + "\n\n"
     sorted_log = sorted(log, key=lambda x: x['date'], reverse=True)
     for i, entry in enumerate(sorted_log, 1):
         log_text += f"*№{i}*: {entry['date']}\n💰 {format_number(entry['amount'])} ₽"
@@ -368,7 +414,7 @@ def view_log(message):
             log_text += f"\n📝 {entry['description']}"
         log_text += "\n\n"
 
-    total, count, avg, max_amt, min_amt = get_log_summary(data)
+    total, count, avg, max_amt, min_amt = get_log_summary(user_data)
     log_text += "═" * 30 + "\n"
     log_text += f"📊 *Итого:* {format_number(total)} ₽\n"
     log_text += f"📈 *Средняя:* {format_number(avg)} ₽\n"
@@ -376,20 +422,22 @@ def view_log(message):
     log_text += f"📉 *Мин:* {format_number(min_amt)} ₽"
     bot.send_message(message.chat.id, log_text, parse_mode='Markdown')
 
+
 @bot.message_handler(func=lambda message: message.text == '➕ Добавить' and user_state.get(message.chat.id) == 'log')
 def add_to_log(message):
     msg = bot.send_message(
         message.chat.id,
-        "Введите сумму для добавления в лог:\n📌 Можно добавить комментарий: '1000 приход от клиента'"
+        "Введите сумму для добавления в ваш лог:\n📌 Можно добавить комментарий: '1000 приход от клиента'"
     )
     bot.register_next_step_handler(msg, process_custom_log)
 
+
 @bot.message_handler(func=lambda message: message.text == '🗑️ Удалить' and user_state.get(message.chat.id) == 'log')
 def delete_from_log(message):
-    data = load_data()
-    log = data['log']
+    user_data = get_user_data(message.from_user.id)
+    log = user_data['log']
     if not log:
-        bot.reply_to(message, "📭 Лог пуст")
+        bot.reply_to(message, "📭 Ваш лог пуст")
         return
 
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -404,67 +452,73 @@ def delete_from_log(message):
     markup.add(btn_cancel)
     bot.send_message(
         message.chat.id,
-        "🗑️ *Выберите запись для удаления:*\n(показываю последние 10)",
+        "🗑️ *Выберите запись для удаления из вашего лога:*\n(показываю последние 10)",
         reply_markup=markup,
         parse_mode='Markdown'
     )
 
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('delete_log_'))
 def handle_delete_log(call):
-    data = load_data()
+    user_data = get_user_data(call.from_user.id)
     entry_id = int(call.data.replace('delete_log_', ''))
-    for i, entry in enumerate(data['log']):
+    for i, entry in enumerate(user_data['log']):
         if entry['id'] == entry_id:
-            deleted = data['log'].pop(i)
-            save_data(data)
+            deleted = user_data['log'].pop(i)
+            save_user_data(call.from_user.id, user_data)
             bot.edit_message_text(
-                f"🗑️ Запись удалена:\n📅 {deleted['date']}\n💰 {format_number(deleted['amount'])} ₽",
+                f"🗑️ Запись удалена из вашего лога:\n📅 {deleted['date']}\n💰 {format_number(deleted['amount'])} ₽",
                 call.message.chat.id, call.message.message_id, parse_mode='Markdown'
             )
             bot.answer_callback_query(call.id, "✅ Запись удалена")
             return
     bot.answer_callback_query(call.id, "❌ Запись не найдена")
 
+
 @bot.callback_query_handler(func=lambda call: call.data == 'cancel_delete')
 def handle_cancel_delete(call):
     bot.edit_message_text("❌ Удаление отменено", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
+
 @bot.message_handler(func=lambda message: message.text == '🧹 Очистить' and user_state.get(message.chat.id) == 'log')
 def clear_log(message):
     markup = types.InlineKeyboardMarkup()
-    btn_yes = types.InlineKeyboardButton("✅ Да, очистить", callback_data="confirm_clear")
+    btn_yes = types.InlineKeyboardButton("✅ Да, очистить мой лог", callback_data="confirm_clear")
     btn_no = types.InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_clear")
     markup.add(btn_yes, btn_no)
     bot.send_message(
         message.chat.id,
-        "⚠️ *ВНИМАНИЕ!*\n\nВы уверены, что хотите очистить весь лог?\nЭто действие НЕЛЬЗЯ отменить!",
+        "⚠️ *ВНИМАНИЕ!*\n\nВы уверены, что хотите очистить весь ваш лог?\nЭто действие НЕЛЬЗЯ отменить!",
         reply_markup=markup,
         parse_mode='Markdown'
     )
 
+
 @bot.callback_query_handler(func=lambda call: call.data == 'confirm_clear')
 def handle_confirm_clear(call):
-    data = load_data()
-    data['log'] = []
-    save_data(data)
-    bot.edit_message_text("🧹 Лог очищен!", call.message.chat.id, call.message.message_id)
+    user_data = get_user_data(call.from_user.id)
+    user_data['log'] = []
+    save_user_data(call.from_user.id, user_data)
+    bot.edit_message_text("🧹 Ваш лог очищен!", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
+
 
 @bot.callback_query_handler(func=lambda call: call.data == 'cancel_clear')
 def handle_cancel_clear(call):
     bot.edit_message_text("❌ Очистка отменена", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
+
 @bot.message_handler(func=lambda message: message.text == '📊 Сумма' and user_state.get(message.chat.id) == 'log')
 def show_log_summary(message):
-    data = load_data()
-    log = data['log']
+    user_data = get_user_data(message.from_user.id)
+    log = user_data['log']
     if not log:
-        bot.reply_to(message, "📭 Лог пуст")
+        bot.reply_to(message, "📭 Ваш лог пуст")
         return
 
-    total, count, avg, max_amt, min_amt = get_log_summary(data)
+    total, count, avg, max_amt, min_amt = get_log_summary(user_data)
     type_26 = sum(entry['amount'] for entry in log if entry.get('type') == '26%')
     type_6 = sum(entry['amount'] for entry in log if entry.get('type') == '6%')
     type_manual = sum(entry['amount'] for entry in log if entry.get('type') == 'manual')
@@ -479,7 +533,7 @@ def show_log_summary(message):
     week_sum = sum(entry['amount'] for entry in log if entry['date'].split()[0] >= week_ago)
     month_sum = sum(entry['amount'] for entry in log if entry['date'].split()[0] >= month_ago)
 
-    stats_text = f"📊 *СТАТИСТИКА ЛОГА*\n\n"
+    stats_text = f"📊 *СТАТИСТИКА ВАШЕГО ЛОГА*\n\n"
     stats_text += f"📋 Всего записей: *{count}*\n💰 Общая сумма: *{format_number(total)}*\n"
     stats_text += f"📈 Средняя: *{format_number(avg)}*\n📈 Макс: *{format_number(max_amt)}*\n📉 Мин: *{format_number(min_amt)}*\n\n"
     stats_text += "═" * 30 + "\n*По типам:*\n"
@@ -493,17 +547,18 @@ def show_log_summary(message):
     stats_text += f"📅 За месяц: {format_number(month_sum)} ₽"
     bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
 
+
 @bot.message_handler(func=lambda message: message.text == '📤 Экспорт' and user_state.get(message.chat.id) == 'log')
 def export_log(message):
-    data = load_data()
-    log = data['log']
+    user_data = get_user_data(message.from_user.id)
+    log = user_data['log']
     if not log:
-        bot.reply_to(message, "📭 Лог пуст")
+        bot.reply_to(message, "📭 Ваш лог пуст")
         return
 
-    filename = f"log_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    filename = f"log_export_{message.from_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(filename, 'w', encoding='utf-8') as f:
-        f.write("=" * 50 + "\n       ВЫГРУЗКА ЛОГА\n" + "=" * 50 + "\n\n")
+        f.write("=" * 50 + "\n       ВЫГРУЗКА ВАШЕГО ЛОГА\n" + "=" * 50 + "\n\n")
         sorted_log = sorted(log, key=lambda x: x['date'])
         total = 0
         for entry in sorted_log:
@@ -517,8 +572,9 @@ def export_log(message):
         f.write("=" * 50 + f"\nИТОГО: {format_number(total)} ₽")
 
     with open(filename, 'rb') as f:
-        bot.send_document(message.chat.id, f, caption="📤 Экспорт лога")
+        bot.send_document(message.chat.id, f, caption="📤 Экспорт вашего лога")
     os.remove(filename)
+
 
 @bot.message_handler(func=lambda message: message.text == '🔍 Фильтр' and user_state.get(message.chat.id) == 'log')
 def filter_log(message):
@@ -528,21 +584,24 @@ def filter_log(message):
     btn_6 = types.InlineKeyboardButton("🔸 6%", callback_data="filter_6")
     btn_manual = types.InlineKeyboardButton("📝 Ручные", callback_data="filter_manual")
     markup.add(btn_all, btn_26, btn_6, btn_manual)
-    bot.send_message(message.chat.id, "🔍 *Выберите фильтр:*", reply_markup=markup, parse_mode='Markdown')
+    bot.send_message(message.chat.id, "🔍 *Выберите фильтр для вашего лога:*", reply_markup=markup,
+                     parse_mode='Markdown')
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('filter_'))
 def handle_filter(call):
-    data = load_data()
+    user_data = get_user_data(call.from_user.id)
     filter_type = call.data.replace('filter_', '')
     if filter_type == 'all':
-        filtered = data['log']
+        filtered = user_data['log']
         title = "Все записи"
     else:
-        filtered = [e for e in data['log'] if e.get('type') == filter_type]
+        filtered = [e for e in user_data['log'] if e.get('type') == filter_type]
         title = f"Записи по типу: {filter_type}"
 
     if not filtered:
-        bot.edit_message_text(f"📭 Нет записей для фильтра '{title}'", call.message.chat.id, call.message.message_id)
+        bot.edit_message_text(f"📭 Нет записей для фильтра '{title}' в вашем логе", call.message.chat.id,
+                              call.message.message_id)
         return
 
     log_text = f"📋 *{title}*\n" + "═" * 30 + "\n\n"
@@ -561,6 +620,7 @@ def handle_filter(call):
     bot.edit_message_text(log_text, call.message.chat.id, call.message.message_id, parse_mode='Markdown')
     bot.answer_callback_query(call.id)
 
+
 # ============================================
 # РЕЖИМ ЦЕЛИ
 # ============================================
@@ -568,6 +628,8 @@ def handle_filter(call):
 @bot.message_handler(func=lambda message: message.text == '🎯 Цель')
 def show_goal_menu(message):
     user_state[message.chat.id] = 'goal'
+    user_data = get_user_data(message.from_user.id)
+
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton('🎯 Установить')
     btn2 = types.KeyboardButton('📊 Статистика')
@@ -576,20 +638,19 @@ def show_goal_menu(message):
     btn5 = types.KeyboardButton('🏠 Главное меню')
     markup.add(btn1, btn2, btn3, btn4, btn5)
 
-    data = load_data()
-    if data.get('goal'):
-        goal = data['goal']
-        total_log = sum(entry['amount'] for entry in data['log'])
+    if user_data.get('goal'):
+        goal = user_data['goal']
+        total_log = sum(entry['amount'] for entry in user_data['log'])
         remaining = goal - total_log
         progress = (total_log / goal) * 100 if goal > 0 else 0
         bar = create_progress_bar(progress)
 
-        stats_text = f"🎯 *ТЕКУЩАЯ ЦЕЛЬ*\n\n💰 Цель: *{format_number(goal)}* ₽\n"
+        stats_text = f"🎯 *ВАША ЦЕЛЬ*\n\n💰 Цель: *{format_number(goal)}* ₽\n"
         stats_text += f"📊 Собрано: *{format_number(total_log)}* ₽ ({progress:.1f}%)\n"
         stats_text += f"📉 Осталось: *{format_number(remaining)}* ₽\n[{bar}] {progress:.1f}%\n"
 
-        if data.get('goal_date'):
-            goal_date = datetime.strptime(data['goal_date'], '%d.%m.%Y')
+        if user_data.get('goal_date'):
+            goal_date = datetime.strptime(user_data['goal_date'], '%d.%m.%Y')
             days_left = (goal_date - datetime.now()).days
             if days_left > 0:
                 per_day = remaining / days_left
@@ -601,25 +662,30 @@ def show_goal_menu(message):
 
         bot.send_message(message.chat.id, stats_text, reply_markup=markup, parse_mode='Markdown')
     else:
-        bot.send_message(message.chat.id, "❌ Цель не установлена!\n\nИспользуйте '🎯 Установить' чтобы создать цель.", reply_markup=markup, parse_mode='Markdown')
+        bot.send_message(message.chat.id,
+                         "❌ У вас нет установленной цели!\n\nИспользуйте '🎯 Установить' чтобы создать цель.",
+                         reply_markup=markup, parse_mode='Markdown')
+
 
 @bot.message_handler(func=lambda message: message.text == '🎯 Установить' and user_state.get(message.chat.id) == 'goal')
 def set_goal(message):
     msg = bot.send_message(
         message.chat.id,
-        "Введите сумму цели (например: 1000000 или 1,000,000):"
+        "Введите сумму вашей цели (например: 1000000 или 1,000,000):"
     )
     bot.register_next_step_handler(msg, process_goal_amount)
+
 
 def process_goal_amount(message):
     try:
         amount = float(message.text.replace(',', '').replace(' ', ''))
-        data = load_data()
-        data['goal'] = amount
-        save_data(data)
+        user_data = get_user_data(message.from_user.id)
+        user_data['goal'] = amount
+        save_user_data(message.from_user.id, user_data)
+
         msg = bot.send_message(
             message.chat.id,
-            f"✅ Цель *{format_number(amount)}* ₽ установлена!\n\n"
+            f"✅ Ваша цель *{format_number(amount)}* ₽ установлена!\n\n"
             "Теперь укажите дату окончания (в формате ДД.ММ.ГГГГ):\n"
             "📌 Пример: 31.12.2024\nИли напишите 'пропустить' чтобы не указывать дату",
             parse_mode='Markdown'
@@ -628,6 +694,7 @@ def process_goal_amount(message):
     except ValueError:
         bot.reply_to(message, "❌ Пожалуйста, введите корректное число!")
 
+
 def process_goal_date(message):
     if message.text.lower() == 'пропустить':
         bot.send_message(message.chat.id, "⏭️ Дата не установлена")
@@ -635,34 +702,37 @@ def process_goal_date(message):
         return
     try:
         goal_date = datetime.strptime(message.text, '%d.%m.%Y')
-        data = load_data()
-        data['goal_date'] = goal_date.strftime('%d.%m.%Y')
-        save_data(data)
-        bot.send_message(message.chat.id, f"✅ Дата цели установлена: *{goal_date.strftime('%d.%m.%Y')}*", parse_mode='Markdown')
+        user_data = get_user_data(message.from_user.id)
+        user_data['goal_date'] = goal_date.strftime('%d.%m.%Y')
+        save_user_data(message.from_user.id, user_data)
+        bot.send_message(message.chat.id, f"✅ Дата вашей цели установлена: *{goal_date.strftime('%d.%m.%Y')}*",
+                         parse_mode='Markdown')
         show_goal_stats(message)
     except ValueError:
         bot.reply_to(message, "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ")
 
+
 @bot.message_handler(func=lambda message: message.text == '📊 Статистика' and user_state.get(message.chat.id) == 'goal')
 def show_goal_stats(message):
-    data = load_data()
-    if not data.get('goal'):
-        bot.reply_to(message, "❌ Цель не установлена!")
+    user_data = get_user_data(message.from_user.id)
+
+    if not user_data.get('goal'):
+        bot.reply_to(message, "❌ У вас нет установленной цели!")
         return
 
-    goal = data['goal']
-    total_log = sum(entry['amount'] for entry in data['log'])
+    goal = user_data['goal']
+    total_log = sum(entry['amount'] for entry in user_data['log'])
     remaining = goal - total_log
     progress = (total_log / goal) * 100 if goal > 0 else 0
     bar = create_progress_bar(progress)
 
-    stats_text = f"🎯 *СТАТИСТИКА ЦЕЛИ*\n\n💰 Цель: *{format_number(goal)}* ₽\n"
+    stats_text = f"🎯 *СТАТИСТИКА ВАШЕЙ ЦЕЛИ*\n\n💰 Цель: *{format_number(goal)}* ₽\n"
     stats_text += f"📊 Собрано: *{format_number(total_log)}* ₽\n"
     stats_text += f"📉 Осталось: *{format_number(remaining)}* ₽\n"
     stats_text += f"📈 Прогресс: *{progress:.1f}%*\n[{bar}] {progress:.1f}%\n"
 
-    if data.get('goal_date'):
-        goal_date = datetime.strptime(data['goal_date'], '%d.%m.%Y')
+    if user_data.get('goal_date'):
+        goal_date = datetime.strptime(user_data['goal_date'], '%d.%m.%Y')
         days_left = (goal_date - datetime.now()).days
         if days_left > 0:
             per_day = remaining / days_left
@@ -674,11 +744,14 @@ def show_goal_stats(message):
 
     bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
 
-@bot.message_handler(func=lambda message: message.text == '✏️ Редактировать' and user_state.get(message.chat.id) == 'goal')
+
+@bot.message_handler(
+    func=lambda message: message.text == '✏️ Редактировать' and user_state.get(message.chat.id) == 'goal')
 def edit_goal(message):
-    data = load_data()
-    if not data.get('goal'):
-        bot.reply_to(message, "❌ Цель не установлена!")
+    user_data = get_user_data(message.from_user.id)
+
+    if not user_data.get('goal'):
+        bot.reply_to(message, "❌ У вас нет установленной цели!")
         return
 
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -688,10 +761,11 @@ def edit_goal(message):
     markup.add(btn1, btn2, btn3)
     bot.send_message(
         message.chat.id,
-        f"✏️ *Редактирование цели*\n\n💰 Сумма: *{format_number(data['goal'])}* ₽\n📅 Дата: *{data.get('goal_date', 'Не установлена')}*",
+        f"✏️ *Редактирование вашей цели*\n\n💰 Сумма: *{format_number(user_data['goal'])}* ₽\n📅 Дата: *{user_data.get('goal_date', 'Не установлена')}*",
         reply_markup=markup,
         parse_mode='Markdown'
     )
+
 
 @bot.callback_query_handler(func=lambda call: call.data == 'edit_goal_amount')
 def handle_edit_goal_amount(call):
@@ -699,65 +773,74 @@ def handle_edit_goal_amount(call):
     bot.register_next_step_handler(msg, process_edit_goal_amount)
     bot.answer_callback_query(call.id)
 
+
 @bot.callback_query_handler(func=lambda call: call.data == 'edit_goal_date')
 def handle_edit_goal_date(call):
     msg = bot.send_message(call.message.chat.id, "Введите новую дату (ДД.ММ.ГГГГ):")
     bot.register_next_step_handler(msg, process_edit_goal_date)
     bot.answer_callback_query(call.id)
 
+
 @bot.callback_query_handler(func=lambda call: call.data == 'back_goal')
 def handle_back_goal(call):
     show_goal_menu(call.message)
     bot.answer_callback_query(call.id)
 
+
 def process_edit_goal_amount(message):
     try:
         amount = float(message.text.replace(',', '').replace(' ', ''))
-        data = load_data()
-        data['goal'] = amount
-        save_data(data)
-        bot.send_message(message.chat.id, f"✅ Цель обновлена: *{format_number(amount)}* ₽", parse_mode='Markdown')
+        user_data = get_user_data(message.from_user.id)
+        user_data['goal'] = amount
+        save_user_data(message.from_user.id, user_data)
+        bot.send_message(message.chat.id, f"✅ Ваша цель обновлена: *{format_number(amount)}* ₽", parse_mode='Markdown')
         show_goal_menu(message)
     except ValueError:
         bot.reply_to(message, "❌ Введите корректное число!")
 
+
 def process_edit_goal_date(message):
     try:
         goal_date = datetime.strptime(message.text, '%d.%m.%Y')
-        data = load_data()
-        data['goal_date'] = goal_date.strftime('%d.%m.%Y')
-        save_data(data)
-        bot.send_message(message.chat.id, f"✅ Дата обновлена: *{goal_date.strftime('%d.%m.%Y')}*", parse_mode='Markdown')
+        user_data = get_user_data(message.from_user.id)
+        user_data['goal_date'] = goal_date.strftime('%d.%m.%Y')
+        save_user_data(message.from_user.id, user_data)
+        bot.send_message(message.chat.id, f"✅ Дата вашей цели обновлена: *{goal_date.strftime('%d.%m.%Y')}*",
+                         parse_mode='Markdown')
         show_goal_menu(message)
     except ValueError:
         bot.reply_to(message, "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ")
 
+
 @bot.message_handler(func=lambda message: message.text == '🗑️ Удалить' and user_state.get(message.chat.id) == 'goal')
 def delete_goal(message):
     markup = types.InlineKeyboardMarkup()
-    btn_yes = types.InlineKeyboardButton("✅ Да, удалить", callback_data="confirm_delete_goal")
+    btn_yes = types.InlineKeyboardButton("✅ Да, удалить мою цель", callback_data="confirm_delete_goal")
     btn_no = types.InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_delete_goal")
     markup.add(btn_yes, btn_no)
     bot.send_message(
         message.chat.id,
-        "⚠️ *ВНИМАНИЕ!*\n\nВы уверены, что хотите удалить цель?",
+        "⚠️ *ВНИМАНИЕ!*\n\nВы уверены, что хотите удалить вашу цель?",
         reply_markup=markup,
         parse_mode='Markdown'
     )
 
+
 @bot.callback_query_handler(func=lambda call: call.data == 'confirm_delete_goal')
 def handle_confirm_delete_goal(call):
-    data = load_data()
-    data['goal'] = None
-    data['goal_date'] = None
-    save_data(data)
-    bot.edit_message_text("🗑️ Цель удалена!", call.message.chat.id, call.message.message_id)
+    user_data = get_user_data(call.from_user.id)
+    user_data['goal'] = None
+    user_data['goal_date'] = None
+    save_user_data(call.from_user.id, user_data)
+    bot.edit_message_text("🗑️ Ваша цель удалена!", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
+
 
 @bot.callback_query_handler(func=lambda call: call.data == 'cancel_delete_goal')
 def handle_cancel_delete_goal(call):
     bot.edit_message_text("❌ Удаление отменено", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
+
 
 # ============================================
 # РЕЖИМ СТАТИСТИКИ
@@ -766,6 +849,8 @@ def handle_cancel_delete_goal(call):
 @bot.message_handler(func=lambda message: message.text == '📊 Статистика')
 def show_stats_menu(message):
     user_state[message.chat.id] = 'stats'
+    user_data = get_user_data(message.from_user.id)
+
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton('📋 Общая')
     btn2 = types.KeyboardButton('📊 По типам')
@@ -774,39 +859,41 @@ def show_stats_menu(message):
     markup.add(btn1, btn2, btn3, btn4)
     bot.send_message(
         message.chat.id,
-        "📊 *РЕЖИМ СТАТИСТИКИ*\n\nВыберите тип статистики:",
+        "📊 *СТАТИСТИКА ВАШИХ ДАННЫХ*\n\nВыберите тип статистики:",
         reply_markup=markup,
         parse_mode='Markdown'
     )
 
+
 @bot.message_handler(func=lambda message: message.text == '📋 Общая' and user_state.get(message.chat.id) == 'stats')
 def show_general_stats(message):
-    data = load_data()
-    log = data['log']
+    user_data = get_user_data(message.from_user.id)
+    log = user_data['log']
     if not log:
-        bot.reply_to(message, "📭 Лог пуст")
+        bot.reply_to(message, "📭 Ваш лог пуст")
         return
 
-    total, count, avg, max_amt, min_amt = get_log_summary(data)
-    stats_text = f"📋 *ОБЩАЯ СТАТИСТИКА*\n\n"
+    total, count, avg, max_amt, min_amt = get_log_summary(user_data)
+    stats_text = f"📋 *ОБЩАЯ СТАТИСТИКА ВАШЕГО ЛОГА*\n\n"
     stats_text += f"📊 Всего записей: *{count}*\n💰 Общая сумма: *{format_number(total)}* ₽\n"
     stats_text += f"📈 Средняя сумма: *{format_number(avg)}* ₽\n"
     stats_text += f"📈 Максимальная: *{format_number(max_amt)}* ₽\n📉 Минимальная: *{format_number(min_amt)}* ₽"
     bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
 
+
 @bot.message_handler(func=lambda message: message.text == '📊 По типам' and user_state.get(message.chat.id) == 'stats')
 def show_type_stats(message):
-    data = load_data()
-    log = data['log']
+    user_data = get_user_data(message.from_user.id)
+    log = user_data['log']
     if not log:
-        bot.reply_to(message, "📭 Лог пуст")
+        bot.reply_to(message, "📭 Ваш лог пуст")
         return
 
     type_26 = [e for e in log if e.get('type') == '26%']
     type_6 = [e for e in log if e.get('type') == '6%']
     type_manual = [e for e in log if e.get('type') == 'manual']
 
-    stats_text = f"📊 *СТАТИСТИКА ПО ТИПАМ*\n\n"
+    stats_text = f"📊 *СТАТИСТИКА ВАШЕГО ЛОГА ПО ТИПАМ*\n\n"
     if type_26:
         total_26 = sum(e['amount'] for e in type_26)
         stats_text += f"🔹 *26% (чистые)*\n   Записей: {len(type_26)}\n   Сумма: {format_number(total_26)} ₽\n\n"
@@ -818,12 +905,14 @@ def show_type_stats(message):
         stats_text += f"📝 *Ручные записи*\n   Записей: {len(type_manual)}\n   Сумма: {format_number(total_manual)} ₽"
     bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
 
-@bot.message_handler(func=lambda message: message.text == '📅 По периодам' and user_state.get(message.chat.id) == 'stats')
+
+@bot.message_handler(
+    func=lambda message: message.text == '📅 По периодам' and user_state.get(message.chat.id) == 'stats')
 def show_period_stats(message):
-    data = load_data()
-    log = data['log']
+    user_data = get_user_data(message.from_user.id)
+    log = user_data['log']
     if not log:
-        bot.reply_to(message, "📭 Лог пуст")
+        bot.reply_to(message, "📭 Ваш лог пуст")
         return
 
     today = get_date_only()
@@ -836,12 +925,13 @@ def show_period_stats(message):
     month_log = [e for e in log if e['date'].split()[0] >= month_ago]
     year_log = [e for e in log if e['date'].split()[0] >= year_ago]
 
-    stats_text = f"📅 *СТАТИСТИКА ПО ПЕРИОДАМ*\n\n"
+    stats_text = f"📅 *СТАТИСТИКА ВАШЕГО ЛОГА ПО ПЕРИОДАМ*\n\n"
     stats_text += f"📌 *Сегодня* ({len(today_log)} записей)\n   Сумма: {format_number(sum(e['amount'] for e in today_log))} ₽\n\n"
     stats_text += f"📌 *За неделю* ({len(week_log)} записей)\n   Сумма: {format_number(sum(e['amount'] for e in week_log))} ₽\n\n"
     stats_text += f"📌 *За месяц* ({len(month_log)} записей)\n   Сумма: {format_number(sum(e['amount'] for e in month_log))} ₽\n\n"
     stats_text += f"📌 *За год* ({len(year_log)} записей)\n   Сумма: {format_number(sum(e['amount'] for e in year_log))} ₽"
     bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
+
 
 # ============================================
 # ПОМОЩЬ И НАВИГАЦИЯ
@@ -853,17 +943,20 @@ def show_help(message):
         "📖 *ПОМОЩЬ*\n\n"
         "🤖 *Бот финансовый помощник*\n\n"
         "💰 *Расчеты* - вычисление 26% и 6% от числа\n"
-        "📋 *Лог* - хранение всех записей с датами\n"
-        "🎯 *Цель* - установка и отслеживание цели\n"
-        "📊 *Статистика* - анализ всех данных\n\n"
+        "📋 *Лог* - хранение всех ваших записей с датами\n"
+        "🎯 *Цель* - установка и отслеживание вашей цели\n"
+        "📊 *Статистика* - анализ ваших данных\n\n"
         "⚡ *Быстрые команды:*\n"
-        "/menu - Главное меню\n/calc - Калькулятор\n/log - Лог\n/goal - Цель\n/stats - Статистика\n/help - Помощь"
+        "/menu - Главное меню\n/calc - Калькулятор\n/log - Лог\n/goal - Цель\n/stats - Статистика\n/help - Помощь\n\n"
+        "👤 *Ваши данные изолированы* — другие пользователи не видят ваш лог и цели."
     )
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
+
 
 @bot.message_handler(func=lambda message: message.text == '🏠 Главное меню')
 def back_to_main(message):
     show_main_menu(message)
+
 
 # ============================================
 # ОБРАБОТЧИК НЕИЗВЕСТНЫХ СООБЩЕНИЙ
@@ -884,6 +977,15 @@ def handle_unknown(message):
                 "❓ Используйте кнопки меню для навигации.\n📌 /menu - открыть главное меню"
             )
 
+
+# ============================================
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (после всех функций)
+# ============================================
+
+user_state = {}
+temp_data = {}
+
+
 # ============================================
 # FLASK ДЛЯ RENDER
 # ============================================
@@ -892,9 +994,22 @@ def handle_unknown(message):
 def index():
     return "✅ Bot is running!"
 
+
 @app.route('/health')
 def health():
     return "OK"
+
+
+# ============================================
+# УДАЛЕНИЕ ВЕБ-ХУКА ПРИ ЗАПУСКЕ (для Render)
+# ============================================
+
+# Удаляем веб-хук при запуске (для Render)
+try:
+    bot.delete_webhook()
+    print("✅ Веб-хук удалён при запуске")
+except Exception as e:
+    print(f"Ошибка удаления веб-хука: {e}")
 
 # ============================================
 # ЗАПУСК (для Render — в отдельном потоке)
@@ -902,8 +1017,10 @@ def health():
 
 if __name__ == '__main__':
     print("🚀 Бот запускается на Render...")
-    print(f"📁 Данные загружены: {len(load_data()['log'])} записей")
-    
+    data = load_data()
+    print(f"📁 Всего пользователей: {len(data.get('users', {}))}")
+
+
     # Запускаем бота в отдельном потоке
     def run_bot():
         while True:
@@ -912,11 +1029,12 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f"❌ Ошибка: {e}")
                 time.sleep(5)
-    
+
+
     bot_thread = threading.Thread(target=run_bot)
     bot_thread.daemon = True
     bot_thread.start()
-    
+
     # Запускаем Flask для health checks
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
