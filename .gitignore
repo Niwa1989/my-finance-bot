@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+
+# Local databases and user data
+app.db
+*.sqlite
+*.sqlite3
+bot_data.json
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
