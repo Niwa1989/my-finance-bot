@@ -94,12 +94,16 @@ def cached_search(query: str, stale_after_seconds: int = 10800) -> tuple[Auction
     return result, snapshot["refreshed_at"], stale
 
 
-def mode_one_lots(lots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Lots with amount 5..25 inclusive, largest amount first."""
+def mode_one_lots(lots: list[dict[str, Any]], limit: int = 25) -> list[dict[str, Any]]:
+    """Return up to ``limit`` cheapest auction lots, regardless of lot amount."""
     return sorted(
-        (lot for lot in lots if 5 <= parser.lot_amount(lot) <= 25),
-        key=lambda lot: (-parser.lot_amount(lot), parser.lot_price(lot) if parser.lot_price(lot) is not None else float("inf")),
-    )
+        lots,
+        key=lambda lot: (
+            parser.lot_price(lot) is None,
+            parser.lot_price(lot) if parser.lot_price(lot) is not None else float("inf"),
+            parser.lot_amount(lot),
+        ),
+    )[:max(0, limit)]
 
 
 def cheapest_full_stack(lots: list[dict[str, Any]], stack_size: int | None) -> dict[str, Any] | None:
