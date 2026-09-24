@@ -951,16 +951,17 @@ def show_auction_menu(message):
     user_state[message.chat.id] = 'auction'
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add(types.KeyboardButton('1️⃣ Лоты 5–25'), types.KeyboardButton('2️⃣ Полный стак'),
-               types.KeyboardButton('🏠 Главное меню'))
+               types.KeyboardButton('3️⃣ Карточки цен'), types.KeyboardButton('🏠 Главное меню'))
     bot.send_message(message.chat.id, '🔨 Выберите режим поиска аукциона:', reply_markup=markup)
 
 
-@bot.message_handler(func=lambda message: message.text in ('1️⃣ Лоты 5–25', '2️⃣ Полный стак') and user_state.get(message.chat.id) == 'auction')
+@bot.message_handler(func=lambda message: message.text in ('1️⃣ Лоты 5–25', '2️⃣ Полный стак', '3️⃣ Карточки цен') and user_state.get(message.chat.id) == 'auction')
 def ask_auction_item(message):
     if message.text.startswith('2'):
         bot.send_message(message.chat.id, auction_service.format_full_stack_list())
         return
-    temp_data[message.chat.id] = {'auction_mode': 1}
+    mode = 3 if message.text.startswith('3') else 1
+    temp_data[message.chat.id] = {'auction_mode': mode}
     msg = bot.send_message(message.chat.id, 'Введите название или ID предмета:')
     bot.register_next_step_handler(msg, process_auction_item)
 
@@ -985,6 +986,17 @@ def process_auction_item(message):
                 for lot in lots[:20]:
                     lines.append(f"• {auction_parser.lot_amount(lot)} шт. — {auction_parser.fmt_money(auction_parser.lot_price(lot))}")
                 text = '\n'.join(lines)
+            bot.send_message(message.chat.id, text)
+        elif mode == 3:
+            text, item_path = auction_service.full_stack_price_card(result)
+            thumbnail_url = auction_service.item_thumbnail_url(item_path)
+            if thumbnail_url:
+                try:
+                    bot.send_photo(message.chat.id, thumbnail_url, caption=text)
+                except Exception:
+                    bot.send_message(message.chat.id, text)
+            else:
+                bot.send_message(message.chat.id, text)
         else:
             size = auction_service.stack_size_for(result.item)
             lot = auction_service.cheapest_full_stack(result.lots, size)
@@ -997,7 +1009,7 @@ def process_auction_item(message):
                 text = f'Для «{result.item.name}» нет точного полного стака ({size} шт.). Частичные лоты не использованы.{freshness}'
             else:
                 text = f'🔨 {result.item.name}\nПолный стак: {size} шт.\nМинимальная цена: {auction_parser.fmt_money(auction_parser.lot_price(lot))}{freshness}'
-        bot.send_message(message.chat.id, text)
+            bot.send_message(message.chat.id, text)
     except RuntimeError as exc:
         bot.send_message(message.chat.id, f'Ошибка аукциона: {exc}')
 
@@ -1037,7 +1049,7 @@ def back_to_main(message):
 def handle_unknown(message):
     if message.text and not message.text.startswith('/'):
         if message.text not in ['💰 Расчеты', '📋 Лог', '🎯 Цель', '📊 Статистика', '🔨 Аукцион', 'ℹ️ Помощь',
-                                '1️⃣ Лоты 5–25', '2️⃣ Полный стак',
+                                '1️⃣ Лоты 5–25', '2️⃣ Полный стак', '3️⃣ Карточки цен',
                                 '🔢 Ввести число', '📋 Добавить в лог',
                                 '📖 Просмотреть', '➕ Добавить', '🗑️ Удалить', '🧹 Очистить',
                                 '📊 Сумма', '📤 Экспорт', '🔍 Фильтр',
