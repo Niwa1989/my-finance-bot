@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: stalzone-finance-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn finance_bot:app
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stalzone-shared-db
+          property: connectionString
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: STALZONE_CLIENT_ID
+        sync: false
+      - key: STALZONE_CLIENT_SECRET
+        sync: false
+
+databases:
+  - name: stalzone-shared-db
+    databaseName: stalzone
+    user: stalzone
