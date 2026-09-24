@@ -110,6 +110,36 @@ def cheapest_full_stack(lots: list[dict[str, Any]], stack_size: int | None) -> d
     return min(exact, key=lambda lot: parser.lot_price(lot) or 0) if exact else None
 
 
+def full_stack_price_card(result: AuctionResult, sizes: dict[str, int] | None = None) -> tuple[str, str | None]:
+    """Build a full-stack price card and return the database item path for its thumbnail."""
+    size = stack_size_for(result.item, sizes)
+    if size is None:
+        return (f"🔨 {result.item.name}\nРазмер стака не подтверждён; цена недоступна.", result.item.path)
+    lot = cheapest_full_stack(result.lots, size)
+    if lot is None:
+        return (f"🔨 {result.item.name}\nНет точного полного стака ({size} шт.).", result.item.path)
+    stack_price = parser.lot_price(lot)
+    unit_price = stack_price // size if stack_price is not None and stack_price % size == 0 else (stack_price / size if stack_price is not None else None)
+    return (
+        f"🔨 {result.item.name}\n"
+        f"Стак: {size} шт.\n"
+        f"Цена за стак: {parser.fmt_money(stack_price)}\n"
+        f"Цена за 1 шт.: {parser.fmt_money(unit_price)}",
+        result.item.path,
+    )
+
+
+def item_thumbnail_url(item_path: str | None, db_base: str | None = None) -> str | None:
+    """Return a public thumbnail URL when the database path points to an image."""
+    if not item_path:
+        return None
+    path = item_path.replace('\\', '/').lstrip('/')
+    if not path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+        return None
+    base = (db_base or os.getenv("STALZONE_DB_BASE", parser.DEFAULT_DB_BASE)).rstrip('/')
+    return f"{base}/{path}"
+
+
 def load_targets(path: str | Path = "resolved_catalog.json") -> list[dict[str, Any]]:
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
