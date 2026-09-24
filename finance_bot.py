@@ -979,12 +979,12 @@ def process_auction_item(message):
         if len(result.matches) > 1:
             bot.send_message(message.chat.id, auction_service.ambiguity_message(result.matches))
         if mode == 1:
-            lots = auction_service.mode_one_lots(result.lots)
+            lots = auction_service.mode_one_lots(result.lots, limit=25)
             if not lots:
-                text = f'Для «{result.item.name}» нет лотов с количеством от 5 до 25.'
+                text = f'Для «{result.item.name}» нет лотов на аукционе.'
             else:
-                lines = [f'🔨 {result.item.name}: лоты 5–25 (по убыванию количества)']
-                for lot in lots[:20]:
+                lines = [f'🔨 {result.item.name}: до 25 самых дешёвых лотов']
+                for lot in lots:
                     lines.append(f"• {auction_parser.lot_amount(lot)} шт. — {auction_parser.fmt_money(auction_parser.lot_price(lot))}")
                 text = '\n'.join(lines)
             bot.send_message(message.chat.id, text)
