@@ -4,6 +4,7 @@ import json
 import shutil
 import threading
 import hashlib
+import logging
 from datetime import datetime, timedelta
 from flask import Flask, request, abort
 import telebot
@@ -1068,6 +1069,49 @@ def handle_unknown(message):
 
 user_state = {}
 temp_data = {}
+
+
+# ============================================
+# ФОНОВОЕ ОБНОВЛЕНИЕ АУКЦИОНА
+# ============================================
+
+AUCTION_REFRESH_ENABLED_ENV = "AUCTION_REFRESH_ENABLED"
+AUCTION_REFRESH_THREAD_NAME = "auction-refresh"
+_refresh_thread_lock = threading.Lock()
+_refresh_thread: threading.Thread | None = None
+
+
+def auction_refresh_enabled() -> bool:
+    """Return whether the in-process auction refresh loop is enabled."""
+    return os.getenv(AUCTION_REFRESH_ENABLED_ENV, "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def start_auction_refresh_thread() -> threading.Thread | None:
+    """Start one daemon refresh loop for this WSGI process without blocking requests."""
+    global _refresh_thread
+    if not auction_refresh_enabled():
+        logging.getLogger(__name__).info("auction refresh is disabled")
+        return None
+
+    with _refresh_thread_lock:
+        if _refresh_thread is not None and _refresh_thread.is_alive():
+            return _refresh_thread
+
+        import auction_refresh_worker
+
+        _refresh_thread = threading.Thread(
+            target=auction_refresh_worker.run_forever,
+            name=AUCTION_REFRESH_THREAD_NAME,
+            daemon=True,
+        )
+        _refresh_thread.start()
+        logging.getLogger(__name__).info("auction refresh thread started")
+        return _refresh_thread
+
+
+# Start at module import for production WSGI. The lock prevents duplicate starts
+# within a process; use one Gunicorn worker so only one service process refreshes.
+start_auction_refresh_thread()
 
 
 # ============================================
