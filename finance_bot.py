@@ -945,7 +945,7 @@ def show_period_stats(message):
 # АУКЦИОН
 # ============================================
 
-@bot.message_handler(commands=['auction'])
+@bot.message_handler(commands=['auction', 'autction'])
 @bot.message_handler(func=lambda message: message.text == '🔨 Аукцион')
 def show_auction_menu(message):
     user_state[message.chat.id] = 'auction'
@@ -957,7 +957,10 @@ def show_auction_menu(message):
 
 @bot.message_handler(func=lambda message: message.text in ('1️⃣ Лоты 5–25', '2️⃣ Полный стак') and user_state.get(message.chat.id) == 'auction')
 def ask_auction_item(message):
-    temp_data[message.chat.id] = {'auction_mode': 1 if message.text.startswith('1') else 2}
+    if message.text.startswith('2'):
+        bot.send_message(message.chat.id, auction_service.format_full_stack_list())
+        return
+    temp_data[message.chat.id] = {'auction_mode': 1}
     msg = bot.send_message(message.chat.id, 'Введите название или ID предмета:')
     bot.register_next_step_handler(msg, process_auction_item)
 
@@ -966,7 +969,11 @@ def process_auction_item(message):
     query = (message.text or '').strip()
     mode = temp_data.get(message.chat.id, {}).get('auction_mode', 1)
     try:
-        result = auction_service.search(query)
+        if mode == 2:
+            result, refreshed_at, stale = auction_service.cached_search(query)
+        else:
+            result = auction_service.search(query)
+            refreshed_at, stale = None, False
         if len(result.matches) > 1:
             bot.send_message(message.chat.id, auction_service.ambiguity_message(result.matches))
         if mode == 1:
@@ -981,10 +988,15 @@ def process_auction_item(message):
         else:
             size = auction_service.stack_size_for(result.item)
             lot = auction_service.cheapest_full_stack(result.lots, size)
-            if lot is None:
-                text = f'Для «{result.item.name}» нет точного полного стака ({size} шт.). Частичные лоты не использованы.'
+            freshness = f"\nОбновлено: {refreshed_at}"
+            if stale:
+                freshness += "\n⚠️ Данные устарели; фоновое обновление временно не удалось."
+            if size is None:
+                text = f'Для «{result.item.name}» размер стака не подтверждён; цена недоступна.{freshness}'
+            elif lot is None:
+                text = f'Для «{result.item.name}» нет точного полного стака ({size} шт.). Частичные лоты не использованы.{freshness}'
             else:
-                text = f'🔨 {result.item.name}\nПолный стак: {size} шт.\nМинимальная цена: {auction_parser.fmt_money(auction_parser.lot_price(lot))}'
+                text = f'🔨 {result.item.name}\nПолный стак: {size} шт.\nМинимальная цена: {auction_parser.fmt_money(auction_parser.lot_price(lot))}{freshness}'
         bot.send_message(message.chat.id, text)
     except RuntimeError as exc:
         bot.send_message(message.chat.id, f'Ошибка аукциона: {exc}')
