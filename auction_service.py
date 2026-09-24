@@ -25,7 +25,7 @@ def load_stack_sizes(path: str | Path = "stack_sizes.json") -> dict[str, int]:
         raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return {str(key): int(value) for key, value in raw.items() if isinstance(value, int) and value in (50, 64)}
+    return {str(key): int(value) for key, value in raw.items() if isinstance(value, int) and value > 0}
 
 
 def stack_size_for(item: parser.Item, sizes: dict[str, int] | None = None) -> int | None:
