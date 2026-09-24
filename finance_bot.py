@@ -9,6 +9,10 @@ from flask import Flask, request, abort
 import telebot
 from telebot import types
 
+import auction_service
+import stalzone_auction_parser as auction_parser
+import storage
+
 # ============================================
 # КОНФИГУРАЦИЯ
 # ============================================
@@ -47,26 +51,26 @@ def get_default_data():
 
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
+    try:
+        data = storage.get_json('finance_data')
+        if isinstance(data, dict):
+            data.setdefault('users', {})
+            return data
+        # One-time migration from the legacy local JSON file.
+        if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                if 'users' not in data:
-                    data['users'] = {}
-                return data
-        except Exception as e:
-            print(f"Ошибка загрузки данных: {e}")
-            return get_default_data()
+            data.setdefault('users', {})
+            storage.set_json('finance_data', data)
+            return data
+    except Exception as e:
+        print(f"Ошибка загрузки данных: {e}")
     return get_default_data()
 
 
 def save_data(data):
     try:
-        backup_filename = f"{BACKUP_DIR}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        if os.path.exists(DATA_FILE):
-            shutil.copy2(DATA_FILE, backup_filename)
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        storage.set_json('finance_data', data)
         return True
     except Exception as e:
         print(f"Ошибка сохранения данных: {e}")
@@ -149,8 +153,9 @@ def show_main_menu(message):
     btn2 = types.KeyboardButton('📋 Лог')
     btn3 = types.KeyboardButton('🎯 Цель')
     btn4 = types.KeyboardButton('📊 Статистика')
-    btn5 = types.KeyboardButton('ℹ️ Помощь')
-    markup.add(btn1, btn2, btn3, btn4, btn5)
+    btn5 = types.KeyboardButton('🔨 Аукцион')
+    btn6 = types.KeyboardButton('ℹ️ Помощь')
+    markup.add(btn1, btn2, btn3, btn4, btn5, btn6)
     bot.send_message(
         message.chat.id,
         "🏠 *БОТ ФИНАНСОВЫЙ ПОМОЩНИК*\n\nВыберите действие:",
@@ -937,6 +942,55 @@ def show_period_stats(message):
 
 
 # ============================================
+# АУКЦИОН
+# ============================================
+
+@bot.message_handler(commands=['auction'])
+@bot.message_handler(func=lambda message: message.text == '🔨 Аукцион')
+def show_auction_menu(message):
+    user_state[message.chat.id] = 'auction'
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(types.KeyboardButton('1️⃣ Лоты 5–25'), types.KeyboardButton('2️⃣ Полный стак'),
+               types.KeyboardButton('🏠 Главное меню'))
+    bot.send_message(message.chat.id, '🔨 Выберите режим поиска аукциона:', reply_markup=markup)
+
+
+@bot.message_handler(func=lambda message: message.text in ('1️⃣ Лоты 5–25', '2️⃣ Полный стак') and user_state.get(message.chat.id) == 'auction')
+def ask_auction_item(message):
+    temp_data[message.chat.id] = {'auction_mode': 1 if message.text.startswith('1') else 2}
+    msg = bot.send_message(message.chat.id, 'Введите название или ID предмета:')
+    bot.register_next_step_handler(msg, process_auction_item)
+
+
+def process_auction_item(message):
+    query = (message.text or '').strip()
+    mode = temp_data.get(message.chat.id, {}).get('auction_mode', 1)
+    try:
+        result = auction_service.search(query)
+        if len(result.matches) > 1:
+            bot.send_message(message.chat.id, auction_service.ambiguity_message(result.matches))
+        if mode == 1:
+            lots = auction_service.mode_one_lots(result.lots)
+            if not lots:
+                text = f'Для «{result.item.name}» нет лотов с количеством от 5 до 25.'
+            else:
+                lines = [f'🔨 {result.item.name}: лоты 5–25 (по убыванию количества)']
+                for lot in lots[:20]:
+                    lines.append(f"• {auction_parser.lot_amount(lot)} шт. — {auction_parser.fmt_money(auction_parser.lot_price(lot))}")
+                text = '\n'.join(lines)
+        else:
+            size = auction_service.stack_size_for(result.item)
+            lot = auction_service.cheapest_full_stack(result.lots, size)
+            if lot is None:
+                text = f'Для «{result.item.name}» нет точного полного стака ({size} шт.). Частичные лоты не использованы.'
+            else:
+                text = f'🔨 {result.item.name}\nПолный стак: {size} шт.\nМинимальная цена: {auction_parser.fmt_money(auction_parser.lot_price(lot))}'
+        bot.send_message(message.chat.id, text)
+    except RuntimeError as exc:
+        bot.send_message(message.chat.id, f'Ошибка аукциона: {exc}')
+
+
+# ============================================
 # ПОМОЩЬ И НАВИГАЦИЯ
 # ============================================
 
@@ -948,7 +1002,8 @@ def show_help(message):
         "💰 *Расчеты* - вычисление 26% и 6% от числа\n"
         "📋 *Лог* - хранение всех ваших записей с датами\n"
         "🎯 *Цель* - установка и отслеживание вашей цели\n"
-        "📊 *Статистика* - анализ ваших данных\n\n"
+        "📊 *Статистика* - анализ ваших данных\n"
+        "🔨 *Аукцион* - лоты 5–25 или минимальная цена точного полного стака\n\n"
         "⚡ *Быстрые команды:*\n"
         "/menu - Главное меню\n/calc - Калькулятор\n/log - Лог\n/goal - Цель\n/stats - Статистика\n"
         "/help - Помощь\n\n"
@@ -969,7 +1024,8 @@ def back_to_main(message):
 @bot.message_handler(func=lambda message: True)
 def handle_unknown(message):
     if message.text and not message.text.startswith('/'):
-        if message.text not in ['💰 Расчеты', '📋 Лог', '🎯 Цель', '📊 Статистика', 'ℹ️ Помощь',
+        if message.text not in ['💰 Расчеты', '📋 Лог', '🎯 Цель', '📊 Статистика', '🔨 Аукцион', 'ℹ️ Помощь',
+                                '1️⃣ Лоты 5–25', '2️⃣ Полный стак',
                                 '🔢 Ввести число', '📋 Добавить в лог',
                                 '📖 Просмотреть', '➕ Добавить', '🗑️ Удалить', '🧹 Очистить',
                                 '📊 Сумма', '📤 Экспорт', '🔍 Фильтр',
