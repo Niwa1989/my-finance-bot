@@ -77,6 +77,22 @@ python .\stalzone_auction_parser.py "ПП-91 Кедр" --region RU --realm ru --
 
 Документация Lunar указывает, что для публичных данных аукциона достаточно заголовков `Client-Id` и `Client-Secret`; OAuth `client_credentials` не обязателен.
 
+## Render: один web-сервис и фоновое обновление кэша
+
+Для Render используется только web-сервис: `gunicorn --workers 1 finance_bot:app`. Отдельный Background Worker не нужен и не должен быть создан.
+
+При запуске web-процесса бот запускает один daemon-поток, который использует `auction_refresh_worker.refresh_once`/`run_forever` и обновляет кэш каждые два часа. Поток не блокирует Flask или Telegram webhook. Один Gunicorn worker обязателен, чтобы не запускать несколько циклов обновления.
+
+Переменные web-сервиса Render:
+
+- `DATABASE_URL`
+- `TELEGRAM_TOKEN`
+- `STALZONE_CLIENT_ID`
+- `STALZONE_CLIENT_SECRET`
+- `AUCTION_REFRESH_ENABLED=true` — включено по умолчанию; установите `false`, `0`, `no` или `off`, чтобы отключить фоновое обновление.
+
+Локальный запуск сохраняется: `python finance_bot.py`. Для локального запуска без обновления задайте `$env:AUCTION_REFRESH_ENABLED="false"` в PowerShell.
+
 ## Telegram-бот и режимы аукциона
 
 Файл `finance_bot.py` сохраняет все прежние финансовые функции и добавляет кнопку `🔨 Аукцион` (также команда `/auction`).
