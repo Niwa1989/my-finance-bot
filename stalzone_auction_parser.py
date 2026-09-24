@@ -142,7 +142,10 @@ def similarity(left: str, right: str) -> float:
     return max(ratio, overlap)
 
 
-def find_item(items: list[Item], query: str, threshold: float = 0.62) -> tuple[Item, list[Item]]:
+def find_item(
+    items: list[Item], query: str, threshold: float = 0.72, ambiguity_margin: float = 0.08,
+) -> tuple[Item, list[Item]]:
+    """Resolve exact names/IDs, but never silently accept weak or ambiguous fuzzy matches."""
     q = normalize(query)
     if not q:
         raise RuntimeError("Введите название или ID предмета.")
@@ -150,17 +153,21 @@ def find_item(items: list[Item], query: str, threshold: float = 0.62) -> tuple[I
     if exact:
         return exact[0], exact
 
-    contains = [item for item in items if q in normalize(item.name) or q in normalize(item.id)]
-    if contains:
-        ranked = sorted(contains, key=lambda item: (-similarity(query, item.name), len(normalize(item.name))))
-        return ranked[0], ranked[:10]
-
-    ranked = sorted(items, key=lambda item: similarity(query, item.name), reverse=True)
-    suggestions = [item for item in ranked[:10] if similarity(query, item.name) >= threshold]
-    if suggestions:
+    ranked = sorted(
+        items,
+        key=lambda item: (-similarity(query, item.name), len(normalize(item.name)), item.name),
+    )
+    scored = [(item, similarity(query, item.name)) for item in ranked]
+    suggestions = [item for item, score in scored[:10] if score >= threshold]
+    best_score = scored[0][1] if scored else 0.0
+    second_score = scored[1][1] if len(scored) > 1 else 0.0
+    if suggestions and (len(suggestions) == 1 or best_score - second_score >= ambiguity_margin):
         return suggestions[0], suggestions
 
-    nearby = ", ".join(item.name for item in ranked[:5])
+    nearby_items = suggestions or [item for item, _ in scored[:5]]
+    nearby = ", ".join(item.name for item in nearby_items[:5])
+    if suggestions:
+        raise RuntimeError(f"Неоднозначное название: {query!r}. Возможно: {nearby}.")
     suffix = f" Возможно: {nearby}." if nearby else ""
     raise RuntimeError(f"Предмет не найден: {query!r}.{suffix}")
 
